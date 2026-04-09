@@ -1,0 +1,10 @@
+services:
+  file-worker:
+    build: .
+    container_name: file-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs 
+      
