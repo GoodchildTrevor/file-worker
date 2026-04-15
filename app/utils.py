@@ -24,14 +24,22 @@ from collections import OrderedDict
 import threading
 
 class FileWorker:
-    _document_cache = OrderedDict()
-    _cache_lock = threading.Lock()
-
-    def __init__(self, logger: Logger, file, format: str, settings: BaseSettings):
+    def __init__(
+            self, 
+            logger: Logger, 
+            file, 
+            format: str, 
+            settings: BaseSettings,
+            diarization_params: dict
+        ):
         self.settings = settings
         self.logger = logger
         self.file = file
+        self.diarization_params = diarization_params
         self.format = format.lower()
+        self._document_cache = OrderedDict()
+        self._cache_lock = threading.Lock()
+
 
     def text_extractor(self) -> str:
         self.logger.info(f"Processing file with format {self.format}")
@@ -266,21 +274,21 @@ class FileWorker:
     def _convert_doc_to_docx(self, doc_path: str | Path) -> str | None:
         """
         Конвертация .doc в .docx с использованием LibreOffice/unoconv
-        
+
         :param doc_path: Путь к исходному .doc файлу
         :return: Путь к конвертированному .docx файлу или None при ошибке
         """
         doc_path = Path(doc_path)
-        
+
         # Проверяем доступность LibreOffice
         if not shutil.which("libreoffice"):
             self.logger.error("LibreOffice not found. Required for .doc conversion.")
             return None
-        
+
         # Создаем временный файл для результата
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
             docx_path = tmp.name
-        
+
         try:
             # Используем LibreOffice для конвертации
             result = subprocess.run(
@@ -295,7 +303,7 @@ class FileWorker:
                 text=True,
                 timeout=60
             )
-            
+
             if result.returncode == 0:
                 # LibreOffice создает файл с тем же именем но с .docx
                 auto_converted = doc_path.with_suffix(".docx")
@@ -308,16 +316,23 @@ class FileWorker:
                     for file in doc_path.parent.glob(f"{doc_path.stem}*.docx"):
                         shutil.move(str(file), docx_path)
                         return docx_path
-            
+
             self.logger.error(f"LibreOffice conversion failed: {result.stderr[:200]}")
             return None
-            
+
         except subprocess.TimeoutExpired:
             self.logger.error("LibreOffice conversion timed out")
             return None
         except Exception as e:
             self.logger.error(f"Unexpected conversion error: {e}", exc_info=True)
             return None
+        finally:
+            # Если временный файл не был использован, удаляем его
+            if os.path.exists(docx_path):
+                try:
+                    os.unlink(docx_path)
+                except Exception as e:
+                    self.logger.warning(f"Failed to cleanup temp docx file: {e}")
 
     def _send_image_to_ollama(self, image_path: str | Path) -> str:
         """
@@ -363,14 +378,15 @@ class FileWorker:
 
     def _safe_decode(self, s: str) -> str:
         """
-        Декодирование метаданных Word при необходимости
+        Декодирование метаданных Word при необходимости.
+        Декодирует только если результат содержит больше кириллических символов, чем исходная строка.
         """
         if not isinstance(s, str):
             return s
         try:
             decoded = s.encode('latin1').decode('cp1251')
-            # Проверяем, стало ли лучше
-            if len(decoded) > len(s) and any(c.isalpha() for c in decoded):
+            cyrillic = lambda t: sum('\u0400' <= c <= '\u04FF' for c in t)
+            if cyrillic(decoded) > cyrillic(s):
                 return decoded
             return s
         except (UnicodeEncodeError, UnicodeDecodeError):
@@ -440,19 +456,14 @@ class FileWorker:
             with open(self.file, "rb") as fh:
                 file_bytes = fh.read()
         except Exception as e:
-            return {"success": False, "error": f"Не удалось прочитать файл: {e}"}
+            return str(e)
 
         try:
             files = {"file": (self.file.name, file_bytes, "application/octet-stream")}
 
-            params = {
-                "language": self.transcription_language,
-                "num_participants": self.transcription_num_participants,
-                "diarization": str(self.diarization).lower(),
-            }
             response = requests.post(
                 self.settings.WHISPER_API_URL,
-                params=params,
+                params=self.diarization_params,
                 files=files,
                 timeout=self.settings.WHISPER_TIMEOUT,
             )
@@ -460,7 +471,8 @@ class FileWorker:
             self.logger.error(f"Error during transcription request: {e}") 
             return str(e)
         if response.status_code == 200:
-            transcription = response.json()
+            result = response.json()
+            transcription = result.get("result", str(result)) 
         else:
             transcription = f"Transcription failed with status {response.status_code}"
 
