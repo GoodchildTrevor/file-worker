@@ -6,7 +6,8 @@ pillow==11.1.0
 pymupdf==1.26.1
 pytesseract==0.3.13
 python-pptx==0.6.21
-pydantic-settings==2.6.1
+pydantic>=2.7.0
+pydantic-settings>=2.6.1
 python_dotenv==0.21.0
 python-multipart==0.0.20
 requests==2.32.5

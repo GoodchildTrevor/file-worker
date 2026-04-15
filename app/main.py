@@ -4,10 +4,11 @@ import os
 from pathlib import Path
 import tempfile
 
-from app.config import SUPPORTED_EXTENSIONS, MIME_TO_EXT, MAX_FILE_SIZE
+from app.config import get_settings
 from app.utils import FileWorker
 
 app = FastAPI()
+settings= get_settings()
 
 LOG_PATH = "fileworker.log"
 logging.basicConfig(
@@ -32,16 +33,16 @@ async def create_item(file: UploadFile = File(...)) -> str:
     :raises HTTPException: If file type is unsupported or processing fails.
     """
     mime_type = file.content_type
-    ext_from_mime = MIME_TO_EXT.get(mime_type)
+    ext_from_mime = settings.MIME_TO_EXT.get(mime_type)
     ext_from_name = Path(file.filename).suffix.lower()
 
-    file_ext = ext_from_mime if ext_from_mime in SUPPORTED_EXTENSIONS else ext_from_name
+    file_ext = ext_from_mime if ext_from_mime in settings.SUPPORTED_EXTENSIONS else ext_from_name
 
-    if file_ext not in SUPPORTED_EXTENSIONS:
-        logger.error(f"Unsupported file format {file_ext}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}")
+    if file_ext not in settings.SUPPORTED_EXTENSIONS:
+        logger.error(f"Unsupported file format {file_ext}. Supported: {', '.join(settings.SUPPORTED_EXTENSIONS)}")
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file format {file_ext}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
+            detail=f"Unsupported file format {file_ext}. Supported: {', '.join(settings.SUPPORTED_EXTENSIONS)}"
         )
     
     try:
@@ -49,17 +50,16 @@ async def create_item(file: UploadFile = File(...)) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read uploaded file: {str(e)}")
     
-    # Проверяем размер
-    if len(content) > MAX_FILE_SIZE:
-        logger.error(f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB")
+    if len(content) > settings.MAX_FILE_SIZE:
+        logger.error(f"File too large. Maximum size is {settings.MAX_FILE_SIZE/1024/1024}MB")
         raise HTTPException(
             status_code=413,
-            detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB"
+            detail=f"File too large. Maximum size is {settings.MAX_FILE_SIZE/1024/1024}MB"
         )
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
-            tmp_file.write(content)  # Используем уже прочитанный content
+            tmp_file.write(content)
             tmp_file_path = tmp_file.name
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")

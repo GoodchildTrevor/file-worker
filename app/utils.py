@@ -12,24 +12,13 @@ from typing import Optional
 
 from docx2python import docx2python
 import pymupdf
-from pymupdf import Document
 from pptx import Presentation
 from PIL import Image
-
-from app.config import (
-    OLLAMA_URL,
-    OLLAMA_VISION_MODEL,
-    IMAGE_PROMPT,
-    PDF_SIZE_LIMIT,
-    PDF_PAGES_LIMIT,
-    DPI,
-    CACHE_MAXSIZE
-)
+from pydantic_settings import BaseSettings
 
 import fitz
 import io
 import re
-
 
 from collections import OrderedDict
 import threading
@@ -38,14 +27,8 @@ class FileWorker:
     _document_cache = OrderedDict()
     _cache_lock = threading.Lock()
 
-    def __init__(self, logger: Logger, file, format: str):
-        self.ollama_url = OLLAMA_URL
-        self.vision_model = OLLAMA_VISION_MODEL
-        self.image_prompt = IMAGE_PROMPT
-        self.pdf_size_limit = PDF_SIZE_LIMIT
-        self.pdf_pages_limit = PDF_PAGES_LIMIT
-        self.dpi = DPI
-        self.cache_maxsize = CACHE_MAXSIZE
+    def __init__(self, logger: Logger, file, format: str, settings: BaseSettings):
+        self.settings = settings
         self.logger = logger
         self.file = file
         self.format = format.lower()
@@ -73,6 +56,10 @@ class FileWorker:
                 text = self._extract_text_from_pptx()
             elif self.format == ".emf":
                 text = self._extract_text_from_emf()
+            elif self.format in [
+                ".mp3", ".wav", ".flac", ".ogg", ".webm", ".mov", ".mkv", ".avi", ".mp4"
+            ]:
+                text = self._extract_text_from_media()
             else:
                 error_msg = f"Unsupported format: {self.format}. No handler implemented in FileWorker."
                 self.logger.error(error_msg)
@@ -133,7 +120,7 @@ class FileWorker:
             self._document_cache[cache_key] = text
             self._document_cache.move_to_end(cache_key)
             # Evict oldest item if over capacity
-            if len(self._document_cache) > self.cache_maxsize:
+            if len(self._document_cache) > self.settings.CACHE_MAXSIZE:
                 self._document_cache.popitem(last=False)
 
     def _extract_text_from_pdf(self) -> str:
@@ -145,15 +132,15 @@ class FileWorker:
         full_text = []
         with pymupdf.open(self.file) as doc:
             pages = len(doc)
-            if pages > self.pdf_pages_limit:
-                raise ValueError(f"Превышен лимит страниц: {pages} > {self.pdf_pages_limit}")
+            if pages > self.settings.PDF_PAGES_LIMIT:
+                raise ValueError(f"Превышен лимит страниц: {pages} > {self.settings.PDF_PAGES_LIMIT}")
             self.logger.info(f"Document contains {pages} pages")
 
             for page_num in range(pages):
                 tmp_img_path = None
                 try:
                     page = doc.load_page(page_num)
-                    pix = page.get_pixmap(dpi=self.dpi)
+                    pix = page.get_pixmap(dpi=self.settings.DPI)
                     
                     # Save page as temporary PNG
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
@@ -346,15 +333,15 @@ class FileWorker:
             img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
             payload = {
-                "model": self.vision_model,
-                "prompt": self.image_prompt,
+                "model": self.settings.OLLAMA_VISION_MODEL,
+                "prompt": self.settings.IMAGE_PROMPT,
                 "images": [img_base64],
                 "stream": False,
                 "options": {"temperature": 0.1},
             }
 
             response = requests.post(
-                self.ollama_url,
+                self.settings.OLLAMA_URL,
                 json=payload,
                 timeout=120
             )
@@ -447,3 +434,34 @@ class FileWorker:
                 Path(png_path).unlink(missing_ok=True)
             except Exception as e:
                 self.logger.warning(f"Failed to remove temp PNG after EMF conversion: {e}")
+
+    def _extract_text_from_media(self) -> str:
+        try:
+            with open(self.file, "rb") as fh:
+                file_bytes = fh.read()
+        except Exception as e:
+            return {"success": False, "error": f"Не удалось прочитать файл: {e}"}
+
+        try:
+            files = {"file": (self.file.name, file_bytes, "application/octet-stream")}
+
+            params = {
+                "language": self.transcription_language,
+                "num_participants": self.transcription_num_participants,
+                "diarization": str(self.diarization).lower(),
+            }
+            response = requests.post(
+                self.settings.WHISPER_API_URL,
+                params=params,
+                files=files,
+                timeout=self.settings.WHISPER_TIMEOUT,
+            )
+        except Exception as e:
+            self.logger.error(f"Error during transcription request: {e}") 
+            return str(e)
+        if response.status_code == 200:
+            transcription = response.json()
+        else:
+            transcription = f"Transcription failed with status {response.status_code}"
+
+        return transcription
