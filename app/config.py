@@ -17,7 +17,6 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE = 200 * 1024 * 1024 
 
     PDF_PAGES_LIMIT = 21
-    PDF_SIZE_LIMIT = 50
     DPI = 300
 
     CACHE_MAXSIZE = 100
@@ -67,7 +66,7 @@ class Settings(BaseSettings):
         "video/x-matroska": ".mkv",
         "video/x-msvideo": ".avi",
     }
-    WHISPER_URL = os.getenv("WHISPER_URL")
+    WHISPER_API_URL = os.getenv("WHISPER_API_URL")
     WHISPER_TIMEOUT = os.getenv("WHISPER_TIMEOUT", 300)
 
 def get_settings() -> Settings:
