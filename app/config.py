@@ -40,17 +40,13 @@ class Settings(BaseSettings):
             3. Шаг 3
     """)
 
-<<<<<<< HEAD
-    SUPPORTED_EXTENSIONS = {
+    SUPPORTED_EXTENSIONS: set = {
         ".pdf", ".jpg", ".jpeg", ".png", ".pptx", ".docx", ".doc", ".emf",
         "audio/mpeg", "audio/wav", "audio/x-wav", "audio/flac", "audio/ogg", "audio/x-flac", "audio/webm",
         "video/mp4", "video/webm", "video/quicktime", "video/x-matroska", "video/x-msvideo",   
     }
 
-    MIME_TO_EXT = {
-=======
     MIME_TO_EXT: dict = {
->>>>>>> 8d6d66f182e57e73ac935900915179f3c20d4f28
         "application/pdf": ".pdf",
         "image/jpeg": ".jpeg",
         "image/png": ".png",
