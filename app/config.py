@@ -40,6 +40,12 @@ class Settings(BaseSettings):
             3. Шаг 3
     """)
 
+    SUPPORTED_EXTENSIONS = {
+        ".pdf", ".jpg", ".jpeg", ".png", ".pptx", ".docx", ".doc", ".emf",
+        "audio/mpeg", "audio/wav", "audio/x-wav", "audio/flac", "audio/ogg", "audio/x-flac", "audio/webm",
+        "video/mp4", "video/webm", "video/quicktime", "video/x-matroska", "video/x-msvideo",   
+    }
+
     MIME_TO_EXT = {
         "application/pdf": ".pdf",
         "image/jpeg": ".jpeg",
