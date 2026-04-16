@@ -457,9 +457,9 @@ class FileWorker:
                 file_bytes = fh.read()
         except Exception as e:
             return str(e)
-
+        filename = os.path.basename(self.file)
         try:
-            files = {"file": (self.file.name, file_bytes, "application/octet-stream")}
+            files = {"file": (filename, file_bytes, "application/octet-stream")}
 
             response = requests.post(
                 self.settings.WHISPER_API_URL,
