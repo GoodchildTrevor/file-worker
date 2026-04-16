@@ -25,19 +25,19 @@ class Settings(BaseSettings):
     OLLAMA_VISION_MODEL: str = os.getenv("OLLAMA_VISION_MODEL", "ministral-3:14b")
 
     IMAGE_PROMPT: str = os.getenv("IMAGE_PROMPT", """
-        Извлеки ВЕСЬ текст с этого изображения документа. 
-        Сохрани точную орфографию, пунктуацию и форматирование.
-        Верни ТОЛЬКО текст, без комментариев.
-        Если есть таблицы - представь их в следующем виде
+        Extract ALL text from this document image.
+        Preserve exact spelling, punctuation, and formatting.
+        Return ONLY the text, without comments.
+        If there are tables, present them in the following format:
         [
-            'Загловок1': 'Значение из строки 1' | 'Загловок2': 'Значение из строки 1',
-            'Загловок1': 'Значение из строки 2' | 'Загловок2': 'Значение из строки 2',
-            'Загловок1': 'Значение из строки 3' | 'Загловок2': 'Значение из строки 3'
-        ]    
-        Если есть схема, то верни её пошаговое описание в виде
-            1. Шаг 1
-            2. Шаг 2
-            3. Шаг 3
+            'Header1': 'Value from row 1' | 'Header2': 'Value from row 1',
+            'Header1': 'Value from row 2' | 'Header2': 'Value from row 2',
+            'Header1': 'Value from row 3' | 'Header2': 'Value from row 3'
+        ]
+        If there is a diagram, return its step-by-step description:
+            1. Step 1
+            2. Step 2
+            3. Step 3
     """)
 
     SUPPORTED_EXTENSIONS: set = {
@@ -72,8 +72,8 @@ class Settings(BaseSettings):
         "video/x-matroska": ".mkv",
         "video/x-msvideo": ".avi",
     }
-    WHISPER_API_URL: str = os.getenv("WHISPER_API_URL")
-    WHISPER_TIMEOUT: int = os.getenv("WHISPER_TIMEOUT", 300)
+    WHISPER_API_URL: str | None = None
+    WHISPER_TIMEOUT: int = 300
 
 def get_settings() -> Settings:
     return Settings()

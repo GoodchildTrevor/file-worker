@@ -141,7 +141,7 @@ class FileWorker:
         with pymupdf.open(self.file) as doc:
             pages = len(doc)
             if pages > self.settings.PDF_PAGES_LIMIT:
-                raise ValueError(f"Превышен лимит страниц: {pages} > {self.settings.PDF_PAGES_LIMIT}")
+                raise ValueError(f"Page limit exceeded: {pages} > {self.settings.PDF_PAGES_LIMIT}")
             self.logger.info(f"Document contains {pages} pages")
 
             for page_num in range(pages):
@@ -160,15 +160,15 @@ class FileWorker:
                     page_text = self._send_image_to_ollama(tmp_img_path)
                     
                     if page_text and not page_text.startswith("["):
-                        full_text.append(f"--- Страница {page_num + 1} ---\n{page_text}")
+                        full_text.append(f"--- Page {page_num + 1} ---\n{page_text}")
                         self.logger.info(f"Page {page_num + 1}: extracted {len(page_text)} chars")
                     else:
-                        full_text.append(f"--- Страница {page_num + 1} [ошибка] ---\n{page_text}")
+                        full_text.append(f"--- Page {page_num + 1} [error] ---\n{page_text}")
                         self.logger.warning(f"Page {page_num + 1} analysis warning: {page_text}")
                 
                 except Exception as e:
-                    error_msg = f"[Ошибка обработки страницы: {str(e)[:100]}]"
-                    full_text.append(f"--- Страница {page_num + 1} [авария] ---\n{error_msg}")
+                    error_msg = f"[Page processing error: {str(e)[:100]}]"
+                    full_text.append(f"--- Page {page_num + 1} [crash] ---\n{error_msg}")
                     self.logger.error(f"Page {page_num + 1} processing crashed", exc_info=True)
                 finally:
                     # Critical fix: guaranteed temp image cleanup on all paths
@@ -185,7 +185,7 @@ class FileWorker:
         
         self.logger.info(f"PDF processing complete: {pages} pages, {total_chars} chars")
         if total_chars < 50:
-            return f"[PDF распознан плохо, всего {total_chars} символов]\n{result}"
+            return f"[PDF poorly recognized, only {total_chars} characters]\n{result}"
         return result
 
     def _convert_emf_to_png(self, emf_path: str) -> str | None:
@@ -240,29 +240,29 @@ class FileWorker:
         """Extract text from standalone image file using Ollama."""
         description = self._send_image_to_ollama(self.file)
         if description and not description.startswith("["):
-            return f"📸 **АНАЛИЗ ИЗОБРАЖЕНИЯ:**\n\n{description}"
+            return f"📸 **IMAGE ANALYSIS:**\n\n{description}"
         return description
 
     def _extract_text_from_word(self) -> str:
-        """Извлечение текста из Word документов (.doc и .docx)"""
+        """Extract text from Word documents (.doc and .docx)"""
         try:
             if self.format == ".doc":
-                # Конвертируем .doc в .docx
+                # Convert .doc to .docx
                 docx_path = self._convert_doc_to_docx(self.file)
                 if not docx_path:
-                    return "[Ошибка: не удалось конвертировать .doc в .docx]"
+                    return "[Error: failed to convert .doc to .docx]"
                 
                 try:
-                    # Используем существующий пайплайн для .docx
+                    # Use existing .docx pipeline
                     with docx2python(docx_path) as doc_result:
                         all_parts = [doc_result.body, doc_result.header, doc_result.footer]
                     return self._word_to_text(all_parts)
                 finally:
-                    # Удаляем временный файл
+                    # Remove temporary file
                     if os.path.exists(docx_path):
                         os.unlink(docx_path)
             else:
-                # Прямая обработка .docx
+                # Direct .docx processing
                 with docx2python(self.file) as doc_result:
                     all_parts = [doc_result.body, doc_result.header, doc_result.footer]
                 return self._word_to_text(all_parts)
@@ -273,24 +273,24 @@ class FileWorker:
 
     def _convert_doc_to_docx(self, doc_path: str | Path) -> str | None:
         """
-        Конвертация .doc в .docx с использованием LibreOffice/unoconv
+        Convert .doc to .docx using LibreOffice/unoconv
 
-        :param doc_path: Путь к исходному .doc файлу
-        :return: Путь к конвертированному .docx файлу или None при ошибке
+        :param doc_path: Path to source .doc file
+        :return: Path to converted .docx file or None on error
         """
         doc_path = Path(doc_path)
 
-        # Проверяем доступность LibreOffice
+        # Check LibreOffice availability
         if not shutil.which("libreoffice"):
             self.logger.error("LibreOffice not found. Required for .doc conversion.")
             return None
 
-        # Создаем временный файл для результата
+        # Create temporary file for result
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
             docx_path = tmp.name
 
         try:
-            # Используем LibreOffice для конвертации
+            # Use LibreOffice for conversion
             result = subprocess.run(
                 [
                     "libreoffice",
@@ -305,14 +305,14 @@ class FileWorker:
             )
 
             if result.returncode == 0:
-                # LibreOffice создает файл с тем же именем но с .docx
+                # LibreOffice creates file with same name but .docx extension
                 auto_converted = doc_path.with_suffix(".docx")
                 if auto_converted.exists():
-                    # Перемещаем в наш временный файл
+                    # Move to our temporary file
                     shutil.move(str(auto_converted), docx_path)
                     return docx_path
                 else:
-                    # Ищем файл в output директории
+                    # Search for file in output directory
                     for file in doc_path.parent.glob(f"{doc_path.stem}*.docx"):
                         shutil.move(str(file), docx_path)
                         return docx_path
@@ -327,7 +327,7 @@ class FileWorker:
             self.logger.error(f"Unexpected conversion error: {e}", exc_info=True)
             return None
         finally:
-            # Если временный файл не был использован, удаляем его
+            # If temporary file was not used, delete it
             if os.path.exists(docx_path):
                 try:
                     os.unlink(docx_path)
@@ -364,22 +364,22 @@ class FileWorker:
             if response.status_code == 200:
                 result = response.json()
                 description = result.get("response", "").strip()
-                return description if description else "[Изображение обработано, но описание не получено]"
+                return description if description else "[Image processed, but no description received]"
             else:
                 error_detail = response.json().get("error", "") if response.headers.get("content-type", "").startswith("application/json") else response.text[:100]
-                return f"[Ошибка Ollama {response.status_code}: {error_detail}]"
+                return f"[Ollama error {response.status_code}: {error_detail}]"
 
         except requests.exceptions.Timeout:
-            return "[Таймаут при обращении к Ollama]"
+            return "[Timeout when connecting to Ollama]"
         except FileNotFoundError:
-            return "[Файл изображения не найден]"
+            return "[Image file not found]"
         except Exception as e:
-            return f"[Ошибка при отправке в Ollama: {str(e)}]"
+            return f"[Error sending to Ollama: {str(e)}]"
 
     def _safe_decode(self, s: str) -> str:
         """
-        Декодирование метаданных Word при необходимости.
-        Декодирует только если результат содержит больше кириллических символов, чем исходная строка.
+        Decode Word metadata if necessary.
+        Only decodes if the result contains more Cyrillic characters than the original string.
         """
         if not isinstance(s, str):
             return s
@@ -404,7 +404,7 @@ class FileWorker:
                         slide_content.append(shape.text.strip())
                 
                 if slide_content:
-                    text_lines.append(f"--- Слайд {slide_num} ---")
+                    text_lines.append(f"--- Slide {slide_num} ---")
                     text_lines.extend(slide_content)
             
             return "\n".join(text_lines)
@@ -414,14 +414,14 @@ class FileWorker:
 
     def _word_to_text(self, all_parts: list[list[list[list[list[str]]]]]) -> str:
         """
-        Извлечение текста из структуры Word документа
+        Extract text from Word document structure
         """
         text_items = []
 
         def extract_text_recursively(data: str | Iterable) -> None:
             if isinstance(data, str):
                 if data and data.strip():
-                    # Декодируем при необходимости
+                    # Decode if necessary
                     decoded = self._safe_decode(data.strip())
                     text_items.append(decoded)
             elif isinstance(data, Iterable):
@@ -431,19 +431,19 @@ class FileWorker:
         for part in all_parts:
             extract_text_recursively(part)
 
-        # Фильтруем пустые строки и объединяем
+        # Filter empty strings and join
         return '\n'.join(filter(None, text_items))
     
     def _extract_text_from_emf(self) -> str:
         """Convert EMF to PNG and extract text via Ollama."""
         png_path = self._convert_emf_to_png(self.file)
         if not png_path:
-            return "[Ошибка: не удалось конвертировать EMF в PNG]"
+            return "[Error: failed to convert EMF to PNG]"
 
         try:
             description = self._send_image_to_ollama(png_path)
             if description and not description.startswith("["):
-                return f"🖼️ **АНАЛИЗ ВЕКТОРНОГО ИЗОБРАЖЕНИЯ (EMF):**\n\n{description}"
+                return f"🖼️ **VECTOR IMAGE ANALYSIS (EMF):**\n\n{description}"
             return description
         finally:
             try:
