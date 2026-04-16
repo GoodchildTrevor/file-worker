@@ -14,17 +14,17 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    MAX_FILE_SIZE = 200 * 1024 * 1024 
+    MAX_FILE_SIZE: int = 200 * 1024 * 1024 
 
-    PDF_PAGES_LIMIT = 21
-    DPI = 300
+    PDF_PAGES_LIMIT: int = 21
+    DPI: int = 300
 
-    CACHE_MAXSIZE = 100
+    CACHE_MAXSIZE: int = 100
 
-    OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434/api/generate")
-    OLLAMA_VISION_MODEL= os.getenv("OLLAMA_VISION_MODEL", "ministral-3:14b")
+    OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://ollama:11434/api/generate")
+    OLLAMA_VISION_MODEL: str = os.getenv("OLLAMA_VISION_MODEL", "ministral-3:14b")
 
-    IMAGE_PROMPT = os.getenv("IMAGE_PROMPT", """
+    IMAGE_PROMPT: str = os.getenv("IMAGE_PROMPT", """
         Извлеки ВЕСЬ текст с этого изображения документа. 
         Сохрани точную орфографию, пунктуацию и форматирование.
         Верни ТОЛЬКО текст, без комментариев.
@@ -40,6 +40,7 @@ class Settings(BaseSettings):
             3. Шаг 3
     """)
 
+<<<<<<< HEAD
     SUPPORTED_EXTENSIONS = {
         ".pdf", ".jpg", ".jpeg", ".png", ".pptx", ".docx", ".doc", ".emf",
         "audio/mpeg", "audio/wav", "audio/x-wav", "audio/flac", "audio/ogg", "audio/x-flac", "audio/webm",
@@ -47,6 +48,9 @@ class Settings(BaseSettings):
     }
 
     MIME_TO_EXT = {
+=======
+    MIME_TO_EXT: dict = {
+>>>>>>> 8d6d66f182e57e73ac935900915179f3c20d4f28
         "application/pdf": ".pdf",
         "image/jpeg": ".jpeg",
         "image/png": ".png",
@@ -72,8 +76,9 @@ class Settings(BaseSettings):
         "video/x-matroska": ".mkv",
         "video/x-msvideo": ".avi",
     }
-    WHISPER_API_URL = os.getenv("WHISPER_API_URL")
-    WHISPER_TIMEOUT = os.getenv("WHISPER_TIMEOUT", 300)
+    WHISPER_API_URL: str = os.getenv("WHISPER_API_URL")
+    WHISPER_TIMEOUT: int = os.getenv("WHISPER_TIMEOUT", 300)
 
 def get_settings() -> Settings:
     return Settings()
+    
