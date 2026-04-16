@@ -42,8 +42,8 @@ class Settings(BaseSettings):
 
     SUPPORTED_EXTENSIONS: set = {
         ".pdf", ".jpg", ".jpeg", ".png", ".pptx", ".docx", ".doc", ".emf",
-        "audio/mpeg", "audio/wav", "audio/x-wav", "audio/flac", "audio/ogg", "audio/x-flac", "audio/webm",
-        "video/mp4", "video/webm", "video/quicktime", "video/x-matroska", "video/x-msvideo",   
+        ".mpeg", ".wav", ".x-wav", ".flac", ".ogg", ".x-flac", ".webm",
+        ".mp4", ".webm", ".quicktime", ".x-matroska", ".x-msvideo",   
     }
 
     MIME_TO_EXT: dict = {
