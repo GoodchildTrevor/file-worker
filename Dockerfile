@@ -5,7 +5,6 @@ RUN apt update && apt install -y \
     libtesseract-dev \
     poppler-utils \
     imagemagick \
-    unoconv \
     libreoffice \
     && rm -rf /var/lib/apt/lists/*
 
