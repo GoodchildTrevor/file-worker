@@ -3,13 +3,13 @@ import os
 from pathlib import Path
 import tempfile
 
-from fastapi import FastAPI, Form,UploadFile, File, HTTPException
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException
 
 from app.config import get_settings
 from app.utils import FileWorker
 
 app = FastAPI()
-settings= get_settings()
+settings = get_settings()
 
 LOG_PATH = "fileworker.log"
 logging.basicConfig(
@@ -32,7 +32,7 @@ async def create_item(
 ) -> str:
     """
     Accepts a file (PDF, image, or PPTX), validates its type,
-    saves it temporarily, and passes it to the `foo` function for text extraction.
+    saves it temporarily, and passes it to the FileWorker for text extraction.
 
     :param file: Uploaded file via multipart/form-data.
     :return: Extracted text from the document.
@@ -56,12 +56,12 @@ async def create_item(
             status_code=400,
             detail=f"Unsupported file format {file_ext}. Supported: {', '.join(settings.SUPPORTED_EXTENSIONS)}"
         )
-    
+
     try:
         content = await file.read()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read uploaded file: {str(e)}")
-    
+
     if len(content) > settings.MAX_FILE_SIZE:
         logger.error(f"File too large. Maximum size is {settings.MAX_FILE_SIZE/1024/1024}MB")
         raise HTTPException(
@@ -80,17 +80,17 @@ async def create_item(
         fileworker = FileWorker(
             logger=logger,
             file=tmp_file_path,
-            format=file_ext,
+            file_fmt=file_ext,
             settings=settings,
             diarization_params=diarization_params
         )
-        extracted_text = fileworker.text_extractor()
+        extracted_text = await fileworker.text_extractor()
     except Exception as e:
         logger.error(f"Text extraction failed: {str(e)}")
         if os.path.exists(tmp_file_path):
             os.unlink(tmp_file_path)
         raise HTTPException(status_code=500, detail=f"Text extraction failed: {str(e)}")
-    
+
     if os.path.exists(tmp_file_path):
         os.unlink(tmp_file_path)
 
