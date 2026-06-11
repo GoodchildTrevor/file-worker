@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 from dotenv import load_dotenv
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,7 +15,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    MAX_FILE_SIZE: int = 200 * 1024 * 1024 
+    MAX_FILE_SIZE: int = 200 * 1024 * 1024
 
     PDF_PAGES_LIMIT: int = 21
     DPI: int = 300
@@ -42,8 +43,8 @@ class Settings(BaseSettings):
 
     SUPPORTED_EXTENSIONS: set = {
         ".pdf", ".jpg", ".jpeg", ".png", ".pptx", ".docx", ".doc", ".emf",
-        ".mpeg", ".wav", ".x-wav", ".flac", ".ogg", ".x-flac", ".webm",
-        ".mp4", ".webm", ".quicktime", ".x-matroska", ".x-msvideo",   
+        ".mp3", ".wav", ".flac", ".ogg", ".webm",
+        ".mp4", ".mov", ".mkv", ".avi",
     }
 
     MIME_TO_EXT: dict = {
@@ -55,7 +56,7 @@ class Settings(BaseSettings):
         "application/msword": ".doc",
         "application/x-emf": ".emf",
         "image/emf": ".emf",
-        
+
         # Audio
         "audio/mpeg": ".mp3",
         "audio/wav": ".wav",
@@ -64,7 +65,7 @@ class Settings(BaseSettings):
         "audio/ogg": ".ogg",
         "audio/x-flac": ".flac",
         "audio/webm": ".webm",
-        
+
         # Video
         "video/mp4": ".mp4",
         "video/webm": ".webm",
@@ -75,6 +76,7 @@ class Settings(BaseSettings):
     WHISPER_API_URL: str | None = None
     WHISPER_TIMEOUT: int = 300
 
+
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
-    

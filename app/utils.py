@@ -4,31 +4,31 @@ import hashlib
 from logging import Logger
 import os
 from pathlib import Path
-import requests
 import shutil
 import subprocess
 import tempfile
 from typing import Optional
 
+import httpx
 from docx2python import docx2python
 import pymupdf
 from pptx import Presentation
 from PIL import Image
 from pydantic_settings import BaseSettings
 
-import fitz
 import io
 import re
 
 from collections import OrderedDict
 import threading
 
+
 class FileWorker:
     def __init__(
-            self, 
-            logger: Logger, 
-            file, 
-            format: str, 
+            self,
+            logger: Logger,
+            file,
+            file_fmt: str,
             settings: BaseSettings,
             diarization_params: dict
         ):
@@ -36,58 +36,63 @@ class FileWorker:
         self.logger = logger
         self.file = file
         self.diarization_params = diarization_params
-        self.format = format.lower()
+        self.file_fmt = file_fmt.lower()
         self._document_cache = OrderedDict()
         self._cache_lock = threading.Lock()
+        self._http_client: httpx.AsyncClient | None = None
 
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=120)
+        return self._http_client
 
-    def text_extractor(self) -> str:
-        self.logger.info(f"Processing file with format {self.format}")
-        
+    async def text_extractor(self) -> str:
+        self.logger.info(f"Processing file with format {self.file_fmt}")
+
         file_hash = None
         try:
             file_hash = self._compute_file_hash(self.file)
-            if (cached := self._get_cached_text(file_hash, self.format)) is not None:
-                self.logger.info(f"Cache HIT for {self.file} ({self.format})")
+            if (cached := self._get_cached_text(file_hash, self.file_fmt)) is not None:
+                self.logger.info(f"Cache HIT for {self.file} ({self.file_fmt})")
                 return cached
         except Exception as e:
             self.logger.warning(f"Failed to hash file, skipping cache: {e}")
 
         try:
-            if self.format in [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"]:
-                text = self._extract_text_from_image()
-            elif self.format == ".pdf":
-                text = self._extract_text_from_pdf()
-            elif self.format in [".docx", ".doc"]:
+            if self.file_fmt in [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"]:
+                text = await self._extract_text_from_image()
+            elif self.file_fmt == ".pdf":
+                text = await self._extract_text_from_pdf()
+            elif self.file_fmt in [".docx", ".doc"]:
                 text = self._extract_text_from_word()
-            elif self.format == ".pptx":
+            elif self.file_fmt == ".pptx":
                 text = self._extract_text_from_pptx()
-            elif self.format == ".emf":
-                text = self._extract_text_from_emf()
-            elif self.format in [
+            elif self.file_fmt == ".emf":
+                text = await self._extract_text_from_emf()
+            elif self.file_fmt in [
                 ".mp3", ".wav", ".flac", ".ogg", ".webm", ".mov", ".mkv", ".avi", ".mp4"
             ]:
-                text = self._extract_text_from_media()
+                text = await self._extract_text_from_media()
             else:
-                error_msg = f"Unsupported format: {self.format}. No handler implemented in FileWorker."
+                error_msg = f"Unsupported format: {self.file_fmt}. No handler implemented in FileWorker."
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
 
             if file_hash is not None and text.strip():
-                self._set_cached_text(file_hash, self.format, text)
-                self.logger.debug(f"Cached result for {file_hash}:{self.format}")
+                self._set_cached_text(file_hash, self.file_fmt, text)
+                self.logger.debug(f"Cached result for {file_hash}:{self.file_fmt}")
 
             self.logger.info(f"Successfully extracted text, length: {len(text)} characters")
             return text
 
         except Exception:
-            self.logger.exception(f"Unhandled exception during {self.format} extraction")
+            self.logger.exception(f"Unhandled exception during {self.file_fmt} extraction")
             raise
 
     def _compute_file_hash(self, file_path: str | Path, chunk_size: int = 8192) -> str:
         """
         Compute SHA256 hash of file content in chunks to handle large files efficiently.
-        
+
         :param file_path: Path to the file
         :param chunk_size: Read buffer size in bytes
         :return: Hexadecimal SHA256 hash string
@@ -99,11 +104,11 @@ class FileWorker:
             while chunk := f.read(chunk_size):
                 sha256.update(chunk)
         return sha256.hexdigest()
-    
+
     def _get_cached_text(self, file_hash: str, file_format: str) -> Optional[str]:
         """
         Retrieve cached extraction result for given file hash and format.
-        
+
         :param file_hash: SHA256 hash of file content
         :param file_format: File extension (e.g., '.pdf')
         :return: Cached text if exists, None otherwise
@@ -114,11 +119,11 @@ class FileWorker:
                 self._document_cache.move_to_end(cache_key)
                 return self._document_cache[cache_key]
         return None
-    
+
     def _set_cached_text(self, file_hash: str, file_format: str, text: str) -> None:
         """
         Store extraction result in cache with LRU eviction policy.
-        
+
         :param file_hash: SHA256 hash of file content
         :param file_format: File extension
         :param text: Extracted text to cache
@@ -131,7 +136,7 @@ class FileWorker:
             if len(self._document_cache) > self.settings.CACHE_MAXSIZE:
                 self._document_cache.popitem(last=False)
 
-    def _extract_text_from_pdf(self) -> str:
+    async def _extract_text_from_pdf(self) -> str:
         """
         Extract text from PDF via page-by-page rasterization and Ollama vision analysis.
         :return: Concatenated text with page markers (Russian labels preserved per business logic)
@@ -149,23 +154,23 @@ class FileWorker:
                 try:
                     page = doc.load_page(page_num)
                     pix = page.get_pixmap(dpi=self.settings.DPI)
-                    
+
                     # Save page as temporary PNG
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
                         tmp_img_path = tmp_img.name
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         img.save(tmp_img_path, format="PNG")
-                    
+
                     # Analyze page image with vision model
-                    page_text = self._send_image_to_ollama(tmp_img_path)
-                    
+                    page_text = await self._send_image_to_ollama(tmp_img_path)
+
                     if page_text and not page_text.startswith("["):
                         full_text.append(f"--- Page {page_num + 1} ---\n{page_text}")
                         self.logger.info(f"Page {page_num + 1}: extracted {len(page_text)} chars")
                     else:
                         full_text.append(f"--- Page {page_num + 1} [error] ---\n{page_text}")
                         self.logger.warning(f"Page {page_num + 1} analysis warning: {page_text}")
-                
+
                 except Exception as e:
                     error_msg = f"[Page processing error: {str(e)[:100]}]"
                     full_text.append(f"--- Page {page_num + 1} [crash] ---\n{error_msg}")
@@ -177,12 +182,12 @@ class FileWorker:
                             os.unlink(tmp_img_path)
                         except OSError as e:
                             self.logger.warning(f"Failed to delete temp image for page {page_num + 1}: {e}")
-        
+
         # Post-processing: normalize line breaks
         result = "\n\n".join(full_text)
         result = re.sub(r'\n{3,}', '\n\n', result)
         total_chars = len(result)
-        
+
         self.logger.info(f"PDF processing complete: {pages} pages, {total_chars} chars")
         if total_chars < 50:
             return f"[PDF poorly recognized, only {total_chars} characters]\n{result}"
@@ -191,21 +196,21 @@ class FileWorker:
     def _convert_emf_to_png(self, emf_path: str) -> str | None:
         """
         Convert EMF vector graphic to PNG using LibreOffice headless mode.
-        
+
         :param emf_path: Path to source EMF file
         :return: Path to converted PNG file, or None on failure
         :note: Requires LibreOffice installed and available in system PATH
         """
         emf_path = Path(emf_path)
         png_path = emf_path.with_suffix(".png")
-        
+
         # Critical fix: verify dependency availability before execution
         if not shutil.which("libreoffice"):
             self.logger.error(
                 "LibreOffice not found in PATH. EMF conversion requires LibreOffice installation."
             )
             return None
-        
+
         try:
             result = subprocess.run(
                 [
@@ -219,7 +224,7 @@ class FileWorker:
                 text=True,
                 timeout=60
             )
-            
+
             if result.returncode == 0 and png_path.exists():
                 return str(png_path)
             else:
@@ -228,7 +233,7 @@ class FileWorker:
                     f"Stderr: {result.stderr[:200]}"
                 )
                 return None
-                
+
         except subprocess.TimeoutExpired:
             self.logger.error("LibreOffice conversion timed out after 60 seconds")
             return None
@@ -236,9 +241,9 @@ class FileWorker:
             self.logger.error(f"Unexpected EMF conversion error: {e}", exc_info=True)
             return None
 
-    def _extract_text_from_image(self) -> str:
+    async def _extract_text_from_image(self) -> str:
         """Extract text from standalone image file using Ollama."""
-        description = self._send_image_to_ollama(self.file)
+        description = await self._send_image_to_ollama(self.file)
         if description and not description.startswith("["):
             return f"📸 **IMAGE ANALYSIS:**\n\n{description}"
         return description
@@ -246,12 +251,12 @@ class FileWorker:
     def _extract_text_from_word(self) -> str:
         """Extract text from Word documents (.doc and .docx)"""
         try:
-            if self.format == ".doc":
+            if self.file_fmt == ".doc":
                 # Convert .doc to .docx
                 docx_path = self._convert_doc_to_docx(self.file)
                 if not docx_path:
                     return "[Error: failed to convert .doc to .docx]"
-                
+
                 try:
                     # Use existing .docx pipeline
                     with docx2python(docx_path) as doc_result:
@@ -266,7 +271,7 @@ class FileWorker:
                 with docx2python(self.file) as doc_result:
                     all_parts = [doc_result.body, doc_result.header, doc_result.footer]
                 return self._word_to_text(all_parts)
-                
+
         except Exception as e:
             self.logger.error(f"Error processing Word document: {e}")
             return ""
@@ -334,18 +339,16 @@ class FileWorker:
                 except Exception as e:
                     self.logger.warning(f"Failed to cleanup temp docx file: {e}")
 
-    def _send_image_to_ollama(self, image_path: str | Path) -> str:
+    async def _send_image_to_ollama(self, image_path: str | Path) -> str:
         """
         Sends an image file to Ollama vision model and returns extracted text.
-        
+
         :param image_path: Path to image file (PNG, JPG, etc.)
         :return: Extracted description or error message
         """
         try:
-            # Read and encode image
             with open(image_path, "rb") as f:
-                img_bytes = f.read()
-            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                img_base64 = base64.b64encode(f.read()).decode('utf-8')
 
             payload = {
                 "model": self.settings.OLLAMA_VISION_MODEL,
@@ -355,21 +358,18 @@ class FileWorker:
                 "options": {"temperature": 0.1},
             }
 
-            response = requests.post(
-                self.settings.OLLAMA_URL,
-                json=payload,
-                timeout=120
-            )
+            client = await self._get_client()
+            response = await client.post(self.settings.OLLAMA_URL, json=payload)
 
             if response.status_code == 200:
-                result = response.json()
-                description = result.get("response", "").strip()
+                description = response.json().get("response", "").strip()
                 return description if description else "[Image processed, but no description received]"
             else:
-                error_detail = response.json().get("error", "") if response.headers.get("content-type", "").startswith("application/json") else response.text[:100]
+                ct = response.headers.get("content-type", "")
+                error_detail = response.json().get("error", "") if ct.startswith("application/json") else response.text[:100]
                 return f"[Ollama error {response.status_code}: {error_detail}]"
 
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             return "[Timeout when connecting to Ollama]"
         except FileNotFoundError:
             return "[Image file not found]"
@@ -391,22 +391,22 @@ class FileWorker:
             return s
         except (UnicodeEncodeError, UnicodeDecodeError):
             return s
-        
+
     def _extract_text_from_pptx(self) -> str:
         try:
             prs = Presentation(self.file)
             text_lines = []
-            
+
             for slide_num, slide in enumerate(prs.slides, 1):
                 slide_content = []
                 for shape in slide.shapes:
                     if hasattr(shape, "text") and shape.text.strip():
                         slide_content.append(shape.text.strip())
-                
+
                 if slide_content:
                     text_lines.append(f"--- Slide {slide_num} ---")
                     text_lines.extend(slide_content)
-            
+
             return "\n".join(text_lines)
         except Exception as e:
             self.logger.error(f"Error processing PowerPoint: {e}")
@@ -433,15 +433,15 @@ class FileWorker:
 
         # Filter empty strings and join
         return '\n'.join(filter(None, text_items))
-    
-    def _extract_text_from_emf(self) -> str:
+
+    async def _extract_text_from_emf(self) -> str:
         """Convert EMF to PNG and extract text via Ollama."""
         png_path = self._convert_emf_to_png(self.file)
         if not png_path:
             return "[Error: failed to convert EMF to PNG]"
 
         try:
-            description = self._send_image_to_ollama(png_path)
+            description = await self._send_image_to_ollama(png_path)
             if description and not description.startswith("["):
                 return f"🖼️ **VECTOR IMAGE ANALYSIS (EMF):**\n\n{description}"
             return description
@@ -451,29 +451,26 @@ class FileWorker:
             except Exception as e:
                 self.logger.warning(f"Failed to remove temp PNG after EMF conversion: {e}")
 
-    def _extract_text_from_media(self) -> str:
-        try:
-            with open(self.file, "rb") as fh:
-                file_bytes = fh.read()
-        except Exception as e:
-            return str(e)
+    async def _extract_text_from_media(self) -> str:
+        """
+        Stream media file to Whisper API without loading it fully into RAM.
+        """
         filename = os.path.basename(self.file)
         try:
-            files = {"file": (filename, file_bytes, "application/octet-stream")}
-
-            response = requests.post(
-                self.settings.WHISPER_API_URL,
-                params=self.diarization_params,
-                files=files,
-                timeout=self.settings.WHISPER_TIMEOUT,
-            )
+            client = await self._get_client()
+            with open(self.file, "rb") as fh:
+                files = {"file": (filename, fh, "application/octet-stream")}
+                response = await client.post(
+                    self.settings.WHISPER_API_URL,
+                    params=self.diarization_params,
+                    files=files,
+                    timeout=self.settings.WHISPER_TIMEOUT,
+                )
         except Exception as e:
-            self.logger.error(f"Error during transcription request: {e}") 
+            self.logger.error(f"Error during transcription request: {e}")
             return str(e)
+
         if response.status_code == 200:
             result = response.json()
-            transcription = result.get("result", str(result)) 
-        else:
-            transcription = f"Transcription failed with status {response.status_code}"
-
-        return transcription
+            return result.get("result", str(result))
+        return f"Transcription failed with status {response.status_code}"
