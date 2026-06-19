@@ -67,6 +67,8 @@ class FileWorker:
                 text = self._extract_text_from_word()
             elif self.file_fmt == ".pptx":
                 text = self._extract_text_from_pptx()
+            elif self.file_fmt == ".xlsx":
+                text = self._extract_text_from_xlsx()
             elif self.file_fmt == ".emf":
                 text = await self._extract_text_from_emf()
             elif self.file_fmt in [
@@ -411,6 +413,33 @@ class FileWorker:
         except Exception as e:
             self.logger.error(f"Error processing PowerPoint: {e}")
             return ""
+
+    def _extract_text_from_xlsx(self) -> str:
+        """
+        Extract text from Excel files (.xlsx).
+        Each sheet becomes a section, each row becomes a pipe-separated line.
+        """
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(self.file, read_only=True, data_only=True)
+            parts = []
+
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                rows = []
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                    if cells:
+                        rows.append(" | ".join(cells))
+                if rows:
+                    parts.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows))
+
+            wb.close()
+            return "\n\n".join(parts) if parts else "[Excel file is empty]"
+
+        except Exception as e:
+            self.logger.error(f"Error processing Excel: {e}")
+            return f"[Excel processing error: {e}]"
 
     def _word_to_text(self, all_parts: list[list[list[list[list[str]]]]]) -> str:
         """
