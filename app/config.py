@@ -43,6 +43,7 @@ class Settings(BaseSettings):
 
     SUPPORTED_EXTENSIONS: set = {
         ".pdf", ".jpg", ".jpeg", ".png", ".pptx", ".docx", ".doc", ".emf",
+        ".xlsx",
         ".mp3", ".wav", ".flac", ".ogg", ".webm",
         ".mp4", ".mov", ".mkv", ".avi",
     }
@@ -56,6 +57,7 @@ class Settings(BaseSettings):
         "application/msword": ".doc",
         "application/x-emf": ".emf",
         "image/emf": ".emf",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
 
         # Audio
         "audio/mpeg": ".mp3",
