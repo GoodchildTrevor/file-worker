@@ -2,6 +2,7 @@ import base64
 from collections.abc import Iterable
 import hashlib
 from logging import Logger
+import json
 import os
 from pathlib import Path
 import shutil
@@ -480,6 +481,46 @@ class FileWorker:
             except Exception as e:
                 self.logger.warning(f"Failed to remove temp PNG after EMF conversion: {e}")
 
+    def _convert_segments_to_text(self, segments: list, diarization: bool) -> str:
+        """Convert WhisperX segments to readable plain text."""
+        try:
+            if not segments:
+                return "Транскрипция недоступна."
+
+            speaker_lines = {}
+            for seg in segments:
+                if isinstance(seg, dict):
+                    speaker = seg.get("speaker", "Unknown")
+                    text = seg.get("text", "").strip()
+                    if not text:
+                        text = (
+                            seg.get("word", "").strip()
+                            or seg.get("segment", "").strip()
+                        )
+                else:
+                    speaker = "Unknown"
+                    text = str(seg).strip()
+
+                if speaker not in speaker_lines:
+                    speaker_lines[speaker] = []
+                if text:
+                    speaker_lines[speaker].append(text)
+
+            lines = []
+            for speaker, texts in speaker_lines.items():
+                if texts:
+                    combined = re.sub(r"\s+", " ", " ".join(texts)).strip()
+                    lines.append(f"**{speaker}**: {combined}" if diarization else combined)
+
+            return "\n\n".join(lines) if lines else str(segments)
+
+        except Exception as e:
+            self.logger.error(f"Error converting segments to text: {e}")
+            try:
+                return json.dumps(segments, ensure_ascii=False, indent=2)
+            except Exception:
+                return str(segments)
+
     async def _extract_text_from_media(self) -> str:
         """
         Stream media file to Whisper API without loading it fully into RAM.
@@ -501,5 +542,23 @@ class FileWorker:
 
         if response.status_code == 200:
             result = response.json()
-            return result.get("result", str(result))
+            raw = result.get("result", result)
+
+            segments = None
+            if isinstance(raw, dict) and "segments" in raw:
+                segments = raw["segments"]
+            elif isinstance(raw, str):
+                try:
+                    inner = json.loads(raw)
+                    if isinstance(inner, dict) and "segments" in inner:
+                        segments = inner["segments"]
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            if segments is not None:
+                diarization = bool(self.diarization_params)
+                return self._convert_segments_to_text(segments, diarization)
+
+            return str(raw)
+
         return f"Transcription failed with status {response.status_code}"
