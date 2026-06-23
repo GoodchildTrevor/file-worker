@@ -44,7 +44,7 @@ class FileWorker:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(timeout=120)
+            self._http_client = httpx.AsyncClient(timeout=120, follow_redirects=True)
         return self._http_client
 
     async def text_extractor(self) -> str:
@@ -532,7 +532,7 @@ class FileWorker:
                 files = {"file": (filename, fh, "application/octet-stream")}
                 response = await client.post(
                     self.settings.WHISPER_API_URL,
-                    params=self.diarization_params,
+                    params=self.diarization_params or {},
                     files=files,
                     timeout=self.settings.WHISPER_TIMEOUT,
                 )
