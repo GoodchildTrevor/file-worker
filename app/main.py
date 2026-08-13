@@ -3,13 +3,17 @@ import os
 from pathlib import Path
 import tempfile
 
+
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+
 
 from app.config import get_settings
 from app.utils import FileWorker
 
+
 app = FastAPI()
 settings = get_settings()
+
 
 LOG_PATH = "fileworker.log"
 logging.basicConfig(
@@ -23,32 +27,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+
 @app.post("/filework", response_model=str)
 async def create_item(
     file: UploadFile = File(...),
     language: str = Form(None),
     diarization: bool = Form(False),
-    num_speakers: int = Form(int(1)),
+    num_speakers: int | None = Form(None),
 ) -> str:
     """
-    Accepts a file (PDF, image, or PPTX), validates its type,
+    Accepts a file (PDF, image, PPTX, audio or video), validates its type,
     saves it temporarily, and passes it to the FileWorker for text extraction.
 
     :param file: Uploaded file via multipart/form-data.
+    :param num_speakers: Ожидаемое число спикеров. None -> транскрайбер
+        (whisperx/pyannote) определит их автоматически.
     :return: Extracted text from the document.
     :raises HTTPException: If file type is unsupported or processing fails.
     """
+    # ВАЖНО: ключи здесь должны совпадать с именами query-параметров
+    # эндпоинта /transcriber ("diarization", "num_participants", "language"),
+    # так как этот словарь пробрасывается как params= в httpx-запросе.
     diarization_params = {
-        "enabled": diarization,
-        "num_speakers": num_speakers,
+        "diarization": diarization,
+        "num_participants": num_speakers,
         "language": language
     } if diarization else None
+
 
     mime_type = file.content_type
     ext_from_mime = settings.MIME_TO_EXT.get(mime_type)
     ext_from_name = Path(file.filename).suffix.lower()
 
+
     file_ext = ext_from_mime if ext_from_mime in settings.SUPPORTED_EXTENSIONS else ext_from_name
+
 
     if file_ext not in settings.SUPPORTED_EXTENSIONS:
         logger.error(f"Unsupported file format {file_ext}. Supported: {', '.join(settings.SUPPORTED_EXTENSIONS)}")
@@ -57,10 +70,12 @@ async def create_item(
             detail=f"Unsupported file format {file_ext}. Supported: {', '.join(settings.SUPPORTED_EXTENSIONS)}"
         )
 
+
     try:
         content = await file.read()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read uploaded file: {str(e)}")
+
 
     if len(content) > settings.MAX_FILE_SIZE:
         logger.error(f"File too large. Maximum size is {settings.MAX_FILE_SIZE/1024/1024}MB")
@@ -69,12 +84,14 @@ async def create_item(
             detail=f"File too large. Maximum size is {settings.MAX_FILE_SIZE/1024/1024}MB"
         )
 
+
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")
+
 
     try:
         fileworker = FileWorker(
@@ -91,10 +108,13 @@ async def create_item(
             os.unlink(tmp_file_path)
         raise HTTPException(status_code=500, detail=f"Text extraction failed: {str(e)}")
 
+
     if os.path.exists(tmp_file_path):
         os.unlink(tmp_file_path)
 
+
     return extracted_text
+
 
 
 if __name__ == "__main__":
