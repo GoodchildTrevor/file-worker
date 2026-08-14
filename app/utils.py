@@ -25,7 +25,50 @@ from collections import OrderedDict
 import threading
 
 
+SPEAKER_PATTERN_STRICT = re.compile(r"\*\*(SPEAKER_\d+)\*\*:\s*")
+SPEAKER_PATTERN_LOOSE = re.compile(r"\**\s*(SPEAKER_\d+)\s*\**:\s*")
+
+# Kept for backward compatibility with any external callers that import
+# SPEAKER_PATTERN directly.
 SPEAKER_PATTERN = re.compile(r"\*\*(SPEAKER_\d+|[^*]+)\*\*:\s*")
+
+
+def _split_transcript_turns(text: str) -> list[tuple[Optional[str], str]]:
+    """
+    Locate speaker turns in a diarized transcript and return them as
+    (speaker_label, remainder_text) pairs, in order.
+
+    Tries the strict "**SPEAKER_NN**:" marker first (the canonical
+    format produced by FileWorker._convert_segments_to_text). If a
+    transcript was mangled upstream (e.g. by a Markdown parser eating
+    asterisks around an underscore-containing label -- a known Telegram
+    legacy-Markdown issue), falls back to a loose pattern that tolerates
+    0-2 asterisks around SPEAKER_NN, so the document still gets split
+    into one paragraph per speaker turn instead of collapsing into a
+    single blob.
+    """
+    matches = list(SPEAKER_PATTERN_STRICT.finditer(text))
+    if not matches:
+        matches = list(SPEAKER_PATTERN_LOOSE.finditer(text))
+
+    if not matches:
+        stripped = text.strip()
+        return [(None, stripped)] if stripped else []
+
+    turns: list[tuple[Optional[str], str]] = []
+
+    preamble = text[:matches[0].start()].strip()
+    if preamble:
+        turns.append((None, preamble))
+
+    for i, m in enumerate(matches):
+        label = m.group(1)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        remainder = text[start:end].strip()
+        turns.append((label, remainder))
+
+    return turns
 
 
 def build_transcript_docx(title: str, text: str) -> Document:
@@ -33,29 +76,27 @@ def build_transcript_docx(title: str, text: str) -> Document:
     Build a Word document from a diarized transcript where each speaker
     turn is formatted as "**SPEAKER_00**: text". Each turn becomes its
     own paragraph with the speaker label in bold.
+
+    Robust to transcripts where the "**...**" markers were partially
+    stripped by an upstream Markdown parser: falls back to a loose
+    match so turns are still split into separate paragraphs instead of
+    collapsing into one.
     """
     doc = Document()
     doc.add_heading(title, level=1)
 
-    parts = re.split(r"(?=\*\*SPEAKER_\d+\*\*:)", text)
-
-    for part in parts:
-        part = part.strip()
-        if not part:
+    for label, remainder in _split_transcript_turns(text):
+        if not remainder and not label:
             continue
 
-        match = SPEAKER_PATTERN.match(part)
         paragraph = doc.add_paragraph()
 
-        if match:
-            speaker_label = match.group(1)
-            remainder = part[match.end():].strip()
-
-            run = paragraph.add_run(f"{speaker_label}: ")
+        if label:
+            run = paragraph.add_run(f"{label}: ")
             run.bold = True
             paragraph.add_run(remainder)
         else:
-            paragraph.add_run(part)
+            paragraph.add_run(remainder)
 
     return doc
 
