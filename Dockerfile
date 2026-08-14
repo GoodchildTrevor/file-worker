@@ -6,6 +6,7 @@ RUN apt update && apt install -y \
     poppler-utils \
     imagemagick \
     libreoffice \
+    pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

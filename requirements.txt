@@ -1,3 +1,4 @@
+aiofiles>=23.2.1
 docx2python==3.5.0
 fastapi==0.115.13
 httpx>=0.27.0
