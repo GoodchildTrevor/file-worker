@@ -489,6 +489,12 @@ class FileWorker:
         its own line, stripped of markdown-sensitive characters
         (_ * ` [ ]) so clients like Telegram never mangle it via
         their Markdown parser (e.g. SPEAKER_00 -> SPEAKER 00).
+
+        As a safety net, a final regex pass guarantees a blank line
+        directly before every remaining "SPEAKER <n>:" occurrence in
+        the assembled text, regardless of how blocks were joined
+        upstream or how a downstream client may have reformatted
+        whitespace.
         """
         try:
             if not segments:
@@ -537,7 +543,18 @@ class FileWorker:
                     f"{label}:\n{combined}" if diarization else combined
                 )
 
-            return "\n\n".join(blocks) if blocks else str(segments)
+            final_text = "\n\n".join(blocks) if blocks else str(segments)
+
+            if diarization:
+                # Safety net: force a blank line before every speaker label,
+                # no matter how the text got mangled upstream/downstream.
+                final_text = re.sub(
+                    r"\s*(?=(?:SPEAKER|\bUnknown)[\s_]*\d*\s*:)",
+                    "\n\n",
+                    final_text,
+                ).strip()
+
+            return final_text
 
         except Exception as e:
             self.logger.error(f"Error converting segments to text: {e}")
