@@ -482,12 +482,20 @@ class FileWorker:
                 self.logger.warning(f"Failed to remove temp PNG after EMF conversion: {e}")
 
     def _convert_segments_to_text(self, segments: list, diarization: bool) -> str:
-        """Convert WhisperX segments to readable plain text."""
+        """
+        Convert WhisperX segments to readable plain text, preserving
+        chronological order. Consecutive segments from the same speaker
+        are merged into one paragraph; when the speaker changes, a new
+        paragraph with a new label starts.
+        """
         try:
             if not segments:
                 return "Транскрипция недоступна."
 
-            speaker_lines = {}
+            blocks = []
+            current_speaker = None
+            current_texts = []
+
             for seg in segments:
                 if isinstance(seg, dict):
                     speaker = seg.get("speaker", "Unknown")
@@ -501,18 +509,27 @@ class FileWorker:
                     speaker = "Unknown"
                     text = str(seg).strip()
 
-                if speaker not in speaker_lines:
-                    speaker_lines[speaker] = []
-                if text:
-                    speaker_lines[speaker].append(text)
+                if not text:
+                    continue
 
-            lines = []
-            for speaker, texts in speaker_lines.items():
-                if texts:
-                    combined = re.sub(r"\s+", " ", " ".join(texts)).strip()
-                    lines.append(f"**{speaker}**: {combined}" if diarization else combined)
+                if speaker != current_speaker:
+                    if current_texts:
+                        combined = re.sub(r"\s+", " ", " ".join(current_texts)).strip()
+                        blocks.append(
+                            f"**{current_speaker}**: {combined}" if diarization else combined
+                        )
+                    current_speaker = speaker
+                    current_texts = [text]
+                else:
+                    current_texts.append(text)
 
-            return "\n\n".join(lines) if lines else str(segments)
+            if current_texts:
+                combined = re.sub(r"\s+", " ", " ".join(current_texts)).strip()
+                blocks.append(
+                    f"**{current_speaker}**: {combined}" if diarization else combined
+                )
+
+            return "\n\n".join(blocks) if blocks else str(segments)
 
         except Exception as e:
             self.logger.error(f"Error converting segments to text: {e}")
