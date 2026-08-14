@@ -485,8 +485,9 @@ class FileWorker:
         """
         Convert WhisperX segments to readable plain text, preserving
         chronological order. Consecutive segments from the same speaker
-        are merged into one paragraph; when the speaker changes, a new
-        paragraph with a new label starts.
+        are merged into one paragraph; the speaker label is placed on
+        its own line (not wrapped in markdown bold, to avoid clients
+        like Telegram mangling ** into single *).
         """
         try:
             if not segments:
@@ -516,7 +517,7 @@ class FileWorker:
                     if current_texts:
                         combined = re.sub(r"\s+", " ", " ".join(current_texts)).strip()
                         blocks.append(
-                            f"**{current_speaker}**: {combined}" if diarization else combined
+                            f"{current_speaker}:\n{combined}" if diarization else combined
                         )
                     current_speaker = speaker
                     current_texts = [text]
@@ -526,7 +527,7 @@ class FileWorker:
             if current_texts:
                 combined = re.sub(r"\s+", " ", " ".join(current_texts)).strip()
                 blocks.append(
-                    f"**{current_speaker}**: {combined}" if diarization else combined
+                    f"{current_speaker}:\n{combined}" if diarization else combined
                 )
 
             return "\n\n".join(blocks) if blocks else str(segments)
