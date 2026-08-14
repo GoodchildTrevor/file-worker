@@ -486,8 +486,9 @@ class FileWorker:
         Convert WhisperX segments to readable plain text, preserving
         chronological order. Consecutive segments from the same speaker
         are merged into one paragraph; the speaker label is placed on
-        its own line (not wrapped in markdown bold, to avoid clients
-        like Telegram mangling ** into single *).
+        its own line, stripped of markdown-sensitive characters
+        (_ * ` [ ]) so clients like Telegram never mangle it via
+        their Markdown parser (e.g. SPEAKER_00 -> SPEAKER 00).
         """
         try:
             if not segments:
@@ -496,6 +497,10 @@ class FileWorker:
             blocks = []
             current_speaker = None
             current_texts = []
+
+            def clean_speaker_label(speaker: str) -> str:
+                label = re.sub(r"[_*`\[\]]", " ", str(speaker))
+                return re.sub(r"\s+", " ", label).strip()
 
             for seg in segments:
                 if isinstance(seg, dict):
@@ -516,8 +521,9 @@ class FileWorker:
                 if speaker != current_speaker:
                     if current_texts:
                         combined = re.sub(r"\s+", " ", " ".join(current_texts)).strip()
+                        label = clean_speaker_label(current_speaker)
                         blocks.append(
-                            f"{current_speaker}:\n{combined}" if diarization else combined
+                            f"{label}:\n{combined}" if diarization else combined
                         )
                     current_speaker = speaker
                     current_texts = [text]
@@ -526,8 +532,9 @@ class FileWorker:
 
             if current_texts:
                 combined = re.sub(r"\s+", " ", " ".join(current_texts)).strip()
+                label = clean_speaker_label(current_speaker)
                 blocks.append(
-                    f"{current_speaker}:\n{combined}" if diarization else combined
+                    f"{label}:\n{combined}" if diarization else combined
                 )
 
             return "\n\n".join(blocks) if blocks else str(segments)
