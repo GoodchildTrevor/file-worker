@@ -28,25 +28,10 @@ import threading
 SPEAKER_PATTERN_STRICT = re.compile(r"\*\*(SPEAKER_\d+)\*\*:\s*")
 SPEAKER_PATTERN_LOOSE = re.compile(r"\**\s*(SPEAKER_\d+)\s*\**:\s*")
 
-# Kept for backward compatibility with any external callers that import
-# SPEAKER_PATTERN directly.
 SPEAKER_PATTERN = re.compile(r"\*\*(SPEAKER_\d+|[^*]+)\*\*:\s*")
 
 
 def _split_transcript_turns(text: str) -> list[tuple[Optional[str], str]]:
-    """
-    Locate speaker turns in a diarized transcript and return them as
-    (speaker_label, remainder_text) pairs, in order.
-
-    Tries the strict "**SPEAKER_NN**:" marker first (the canonical
-    format produced by FileWorker._convert_segments_to_text). If a
-    transcript was mangled upstream (e.g. by a Markdown parser eating
-    asterisks around an underscore-containing label -- a known Telegram
-    legacy-Markdown issue), falls back to a loose pattern that tolerates
-    0-2 asterisks around SPEAKER_NN, so the document still gets split
-    into one paragraph per speaker turn instead of collapsing into a
-    single blob.
-    """
     matches = list(SPEAKER_PATTERN_STRICT.finditer(text))
     if not matches:
         matches = list(SPEAKER_PATTERN_LOOSE.finditer(text))
@@ -72,16 +57,6 @@ def _split_transcript_turns(text: str) -> list[tuple[Optional[str], str]]:
 
 
 def build_transcript_docx(title: str, text: str) -> Document:
-    """
-    Build a Word document from a diarized transcript where each speaker
-    turn is formatted as "**SPEAKER_00**: text". Each turn becomes its
-    own paragraph with the speaker label in bold.
-
-    Robust to transcripts where the "**...**" markers were partially
-    stripped by an upstream Markdown parser: falls back to a loose
-    match so turns are still split into separate paragraphs instead of
-    collapsing into one.
-    """
     doc = Document()
     doc.add_heading(title, level=1)
 
@@ -319,6 +294,7 @@ class FileWorker:
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
             docx_path = tmp.name
 
+        converted_path: str | None = None
         try:
             result = subprocess.run(
                 [
@@ -337,10 +313,12 @@ class FileWorker:
                 auto_converted = doc_path.with_suffix(".docx")
                 if auto_converted.exists():
                     shutil.move(str(auto_converted), docx_path)
+                    converted_path = docx_path
                     return docx_path
                 else:
                     for file in doc_path.parent.glob(f"{doc_path.stem}*.docx"):
                         shutil.move(str(file), docx_path)
+                        converted_path = docx_path
                         return docx_path
 
             self.logger.error(f"LibreOffice conversion failed: {result.stderr[:200]}")
@@ -353,7 +331,7 @@ class FileWorker:
             self.logger.error(f"Unexpected conversion error: {e}", exc_info=True)
             return None
         finally:
-            if os.path.exists(docx_path):
+            if converted_path is None and os.path.exists(docx_path):
                 try:
                     os.unlink(docx_path)
                 except Exception as e:
@@ -479,16 +457,6 @@ class FileWorker:
                 self.logger.warning(f"Failed to remove temp PNG after EMF conversion: {e}")
 
     def _convert_segments_to_text(self, segments: list, diarization: bool) -> str:
-        """
-        Convert WhisperX segments to readable plain text, preserving
-        chronological order. Consecutive segments from the same speaker
-        are merged into ONE turn/paragraph. Each turn is emitted as
-        "**SPEAKER_NN**: text" -- this exact format is required by
-        owui-tools/transcriber.py (SPEAKER_PATTERN /
-        build_transcript_docx), which splits on
-        (?=\*\*SPEAKER_\d+\*\*:) to build one docx paragraph per turn.
-        Do not change this format without updating the consumer too.
-        """
         try:
             if not segments:
                 return "Транскрипция недоступна."
@@ -556,7 +524,11 @@ class FileWorker:
             return str(e)
 
         if response.status_code == 200:
-            result = response.json()
+            try:
+                result = response.json()
+            except Exception:
+                return response.text
+
             raw = result.get("result", result)
 
             segments = None
