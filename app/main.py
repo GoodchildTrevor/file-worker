@@ -39,8 +39,14 @@ logger = logging.getLogger(__name__)
 EXPORT_DIR = os.path.realpath((os.getenv("FILE_EXPORT_DIR") or "/output").rstrip("/"))
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# Публичный адрес, под которым nginx проксирует этот сервис наружу.
+# Публичный адрес, под которым nginx проксирует этот сервис наружу
+# (должен включать тот же префикс пути, что и FILE_ROUTE_PREFIX ниже).
 PUBLIC_BASE_URL = os.getenv("FILE_EXPORT_BASE_URL", "https://your-domain.example/files").rstrip("/")
+
+# Префикс пути для раздачи файлов внутри самого сервиса.
+# ВАЖНО: должен буквально совпадать с тем, что настроено в nginx
+# (location + proxy_pass) и с хвостом FILE_EXPORT_BASE_URL — иначе 404.
+FILE_ROUTE_PREFIX = "/" + os.getenv("FILE_ROUTE_PREFIX", "files").strip("/")
 
 FILE_TTL_DAYS = float(os.getenv("FILE_TTL_DAYS", "7"))
 FILE_TTL_SECONDS = FILE_TTL_DAYS * 24 * 60 * 60
@@ -149,7 +155,7 @@ async def export_docx(payload: ExportDocxRequest) -> ExportDocxResponse:
     return ExportDocxResponse(link=link)
 
 
-@app.get("/files/{folder_name}/{filename}")
+@app.get(FILE_ROUTE_PREFIX + "/{folder_name}/{filename}")
 async def serve_file(folder_name: str, filename: str):
     if ".." in folder_name or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid path")
@@ -177,7 +183,7 @@ async def serve_file(folder_name: str, filename: str):
     )
 
 
-app.mount("/files", StaticFiles(directory=EXPORT_DIR), name="files")
+app.mount(FILE_ROUTE_PREFIX, StaticFiles(directory=EXPORT_DIR), name="exported_files")
 
 
 # --- Существующий эндпоинт извлечения текста (без изменений) ---------------
