@@ -11,6 +11,7 @@ import tempfile
 from typing import Optional
 
 import httpx
+from docx import Document
 from docx2python import docx2python
 import pymupdf
 from pptx import Presentation
@@ -22,6 +23,41 @@ import re
 
 from collections import OrderedDict
 import threading
+
+
+SPEAKER_PATTERN = re.compile(r"\*\*(SPEAKER_\d+|[^*]+)\*\*:\s*")
+
+
+def build_transcript_docx(title: str, text: str) -> Document:
+    """
+    Build a Word document from a diarized transcript where each speaker
+    turn is formatted as "**SPEAKER_00**: text". Each turn becomes its
+    own paragraph with the speaker label in bold.
+    """
+    doc = Document()
+    doc.add_heading(title, level=1)
+
+    parts = re.split(r"(?=\*\*SPEAKER_\d+\*\*:)", text)
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        match = SPEAKER_PATTERN.match(part)
+        paragraph = doc.add_paragraph()
+
+        if match:
+            speaker_label = match.group(1)
+            remainder = part[match.end():].strip()
+
+            run = paragraph.add_run(f"{speaker_label}: ")
+            run.bold = True
+            paragraph.add_run(remainder)
+        else:
+            paragraph.add_run(part)
+
+    return doc
 
 
 class FileWorker:
@@ -93,15 +129,6 @@ class FileWorker:
             raise
 
     def _compute_file_hash(self, file_path: str | Path, chunk_size: int = 8192) -> str:
-        """
-        Compute SHA256 hash of file content in chunks to handle large files efficiently.
-
-        :param file_path: Path to the file
-        :param chunk_size: Read buffer size in bytes
-        :return: Hexadecimal SHA256 hash string
-        :raises FileNotFoundError: If file does not exist
-        :raises IOError: On read errors
-        """
         sha256 = hashlib.sha256()
         with open(file_path, 'rb') as f:
             while chunk := f.read(chunk_size):
@@ -109,13 +136,6 @@ class FileWorker:
         return sha256.hexdigest()
 
     def _get_cached_text(self, file_hash: str, file_format: str) -> Optional[str]:
-        """
-        Retrieve cached extraction result for given file hash and format.
-
-        :param file_hash: SHA256 hash of file content
-        :param file_format: File extension (e.g., '.pdf')
-        :return: Cached text if exists, None otherwise
-        """
         cache_key = f"{file_hash}:{file_format}"
         with self._cache_lock:
             if cache_key in self._document_cache:
@@ -124,27 +144,14 @@ class FileWorker:
         return None
 
     def _set_cached_text(self, file_hash: str, file_format: str, text: str) -> None:
-        """
-        Store extraction result in cache with LRU eviction policy.
-
-        :param file_hash: SHA256 hash of file content
-        :param file_format: File extension
-        :param text: Extracted text to cache
-        """
         cache_key = f"{file_hash}:{file_format}"
         with self._cache_lock:
             self._document_cache[cache_key] = text
             self._document_cache.move_to_end(cache_key)
-            # Evict oldest item if over capacity
             if len(self._document_cache) > self.settings.CACHE_MAXSIZE:
                 self._document_cache.popitem(last=False)
 
     async def _extract_text_from_pdf(self) -> str:
-        """
-        Extract text from PDF via page-by-page rasterization and Ollama vision analysis.
-        :return: Concatenated text with page markers (Russian labels preserved per business logic)
-        :raises Exception: Propagates critical PDF processing failures
-        """
         full_text = []
         with pymupdf.open(self.file) as doc:
             pages = len(doc)
@@ -158,13 +165,11 @@ class FileWorker:
                     page = doc.load_page(page_num)
                     pix = page.get_pixmap(dpi=self.settings.DPI)
 
-                    # Save page as temporary PNG
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
                         tmp_img_path = tmp_img.name
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         img.save(tmp_img_path, format="PNG")
 
-                    # Analyze page image with vision model
                     page_text = await self._send_image_to_ollama(tmp_img_path)
 
                     if page_text and not page_text.startswith("["):
@@ -179,14 +184,12 @@ class FileWorker:
                     full_text.append(f"--- Page {page_num + 1} [crash] ---\n{error_msg}")
                     self.logger.error(f"Page {page_num + 1} processing crashed", exc_info=True)
                 finally:
-                    # Critical fix: guaranteed temp image cleanup on all paths
                     if tmp_img_path and os.path.exists(tmp_img_path):
                         try:
                             os.unlink(tmp_img_path)
                         except OSError as e:
                             self.logger.warning(f"Failed to delete temp image for page {page_num + 1}: {e}")
 
-        # Post-processing: normalize line breaks
         result = "\n\n".join(full_text)
         result = re.sub(r'\n{3,}', '\n\n', result)
         total_chars = len(result)
@@ -197,17 +200,9 @@ class FileWorker:
         return result
 
     def _convert_emf_to_png(self, emf_path: str) -> str | None:
-        """
-        Convert EMF vector graphic to PNG using LibreOffice headless mode.
-
-        :param emf_path: Path to source EMF file
-        :return: Path to converted PNG file, or None on failure
-        :note: Requires LibreOffice installed and available in system PATH
-        """
         emf_path = Path(emf_path)
         png_path = emf_path.with_suffix(".png")
 
-        # Critical fix: verify dependency availability before execution
         if not shutil.which("libreoffice"):
             self.logger.error(
                 "LibreOffice not found in PATH. EMF conversion requires LibreOffice installation."
@@ -245,32 +240,26 @@ class FileWorker:
             return None
 
     async def _extract_text_from_image(self) -> str:
-        """Extract text from standalone image file using Ollama."""
         description = await self._send_image_to_ollama(self.file)
         if description and not description.startswith("["):
             return f"📸 **IMAGE ANALYSIS:**\n\n{description}"
         return description
 
     def _extract_text_from_word(self) -> str:
-        """Extract text from Word documents (.doc and .docx)"""
         try:
             if self.file_fmt == ".doc":
-                # Convert .doc to .docx
                 docx_path = self._convert_doc_to_docx(self.file)
                 if not docx_path:
                     return "[Error: failed to convert .doc to .docx]"
 
                 try:
-                    # Use existing .docx pipeline
                     with docx2python(docx_path) as doc_result:
                         all_parts = [doc_result.body, doc_result.header, doc_result.footer]
                     return self._word_to_text(all_parts)
                 finally:
-                    # Remove temporary file
                     if os.path.exists(docx_path):
                         os.unlink(docx_path)
             else:
-                # Direct .docx processing
                 with docx2python(self.file) as doc_result:
                     all_parts = [doc_result.body, doc_result.header, doc_result.footer]
                 return self._word_to_text(all_parts)
@@ -280,25 +269,16 @@ class FileWorker:
             return ""
 
     def _convert_doc_to_docx(self, doc_path: str | Path) -> str | None:
-        """
-        Convert .doc to .docx using LibreOffice/unoconv
-
-        :param doc_path: Path to source .doc file
-        :return: Path to converted .docx file or None on error
-        """
         doc_path = Path(doc_path)
 
-        # Check LibreOffice availability
         if not shutil.which("libreoffice"):
             self.logger.error("LibreOffice not found. Required for .doc conversion.")
             return None
 
-        # Create temporary file for result
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
             docx_path = tmp.name
 
         try:
-            # Use LibreOffice for conversion
             result = subprocess.run(
                 [
                     "libreoffice",
@@ -313,14 +293,11 @@ class FileWorker:
             )
 
             if result.returncode == 0:
-                # LibreOffice creates file with same name but .docx extension
                 auto_converted = doc_path.with_suffix(".docx")
                 if auto_converted.exists():
-                    # Move to our temporary file
                     shutil.move(str(auto_converted), docx_path)
                     return docx_path
                 else:
-                    # Search for file in output directory
                     for file in doc_path.parent.glob(f"{doc_path.stem}*.docx"):
                         shutil.move(str(file), docx_path)
                         return docx_path
@@ -335,7 +312,6 @@ class FileWorker:
             self.logger.error(f"Unexpected conversion error: {e}", exc_info=True)
             return None
         finally:
-            # If temporary file was not used, delete it
             if os.path.exists(docx_path):
                 try:
                     os.unlink(docx_path)
@@ -343,12 +319,6 @@ class FileWorker:
                     self.logger.warning(f"Failed to cleanup temp docx file: {e}")
 
     async def _send_image_to_ollama(self, image_path: str | Path) -> str:
-        """
-        Sends an image file to Ollama vision model and returns extracted text.
-
-        :param image_path: Path to image file (PNG, JPG, etc.)
-        :return: Extracted description or error message
-        """
         try:
             with open(image_path, "rb") as f:
                 img_base64 = base64.b64encode(f.read()).decode('utf-8')
@@ -380,10 +350,6 @@ class FileWorker:
             return f"[Error sending to Ollama: {str(e)}]"
 
     def _safe_decode(self, s: str) -> str:
-        """
-        Decode Word metadata if necessary.
-        Only decodes if the result contains more Cyrillic characters than the original string.
-        """
         if not isinstance(s, str):
             return s
         try:
@@ -416,10 +382,6 @@ class FileWorker:
             return ""
 
     def _extract_text_from_xlsx(self) -> str:
-        """
-        Extract text from Excel files (.xlsx).
-        Each sheet becomes a section, each row becomes a pipe-separated line.
-        """
         try:
             import openpyxl
             wb = openpyxl.load_workbook(self.file, read_only=True, data_only=True)
@@ -443,15 +405,11 @@ class FileWorker:
             return f"[Excel processing error: {e}]"
 
     def _word_to_text(self, all_parts: list[list[list[list[list[str]]]]]) -> str:
-        """
-        Extract text from Word document structure
-        """
         text_items = []
 
         def extract_text_recursively(data: str | Iterable) -> None:
             if isinstance(data, str):
                 if data and data.strip():
-                    # Decode if necessary
                     decoded = self._safe_decode(data.strip())
                     text_items.append(decoded)
             elif isinstance(data, Iterable):
@@ -461,11 +419,9 @@ class FileWorker:
         for part in all_parts:
             extract_text_recursively(part)
 
-        # Filter empty strings and join
         return '\n'.join(filter(None, text_items))
 
     async def _extract_text_from_emf(self) -> str:
-        """Convert EMF to PNG and extract text via Ollama."""
         png_path = self._convert_emf_to_png(self.file)
         if not png_path:
             return "[Error: failed to convert EMF to PNG]"
@@ -485,16 +441,12 @@ class FileWorker:
         """
         Convert WhisperX segments to readable plain text, preserving
         chronological order. Consecutive segments from the same speaker
-        are merged into one paragraph; the speaker label is placed on
-        its own line, stripped of markdown-sensitive characters
-        (_ * ` [ ]) so clients like Telegram never mangle it via
-        their Markdown parser (e.g. SPEAKER_00 -> SPEAKER 00).
-
-        As a safety net, a final regex pass guarantees a blank line
-        directly before every remaining "SPEAKER <n>:" occurrence in
-        the assembled text, regardless of how blocks were joined
-        upstream or how a downstream client may have reformatted
-        whitespace.
+        are merged into ONE turn/paragraph. Each turn is emitted as
+        "**SPEAKER_NN**: text" -- this exact format is required by
+        owui-tools/transcriber.py (SPEAKER_PATTERN /
+        build_transcript_docx), which splits on
+        (?=\*\*SPEAKER_\d+\*\*:) to build one docx paragraph per turn.
+        Do not change this format without updating the consumer too.
         """
         try:
             if not segments:
@@ -503,10 +455,6 @@ class FileWorker:
             blocks = []
             current_speaker = None
             current_texts = []
-
-            def clean_speaker_label(speaker: str) -> str:
-                label = re.sub(r"[_*`\[\]]", " ", str(speaker))
-                return re.sub(r"\s+", " ", label).strip()
 
             for seg in segments:
                 if isinstance(seg, dict):
@@ -527,9 +475,8 @@ class FileWorker:
                 if speaker != current_speaker:
                     if current_texts:
                         combined = re.sub(r"\s+", " ", " ".join(current_texts)).strip()
-                        label = clean_speaker_label(current_speaker)
                         blocks.append(
-                            f"{label}:\n{combined}" if diarization else combined
+                            f"**{current_speaker}**: {combined}" if diarization else combined
                         )
                     current_speaker = speaker
                     current_texts = [text]
@@ -538,23 +485,11 @@ class FileWorker:
 
             if current_texts:
                 combined = re.sub(r"\s+", " ", " ".join(current_texts)).strip()
-                label = clean_speaker_label(current_speaker)
                 blocks.append(
-                    f"{label}:\n{combined}" if diarization else combined
+                    f"**{current_speaker}**: {combined}" if diarization else combined
                 )
 
-            final_text = "\n\n".join(blocks) if blocks else str(segments)
-
-            if diarization:
-                # Safety net: force a blank line before every speaker label,
-                # no matter how the text got mangled upstream/downstream.
-                final_text = re.sub(
-                    r"\s*(?=(?:SPEAKER|\bUnknown)[\s_]*\d*\s*:)",
-                    "\n\n",
-                    final_text,
-                ).strip()
-
-            return final_text
+            return "\n\n".join(blocks) if blocks else str(segments)
 
         except Exception as e:
             self.logger.error(f"Error converting segments to text: {e}")
@@ -564,9 +499,6 @@ class FileWorker:
                 return str(segments)
 
     async def _extract_text_from_media(self) -> str:
-        """
-        Stream media file to Whisper API without loading it fully into RAM.
-        """
         filename = os.path.basename(self.file)
         try:
             client = await self._get_client()
