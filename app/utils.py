@@ -11,69 +11,16 @@ import tempfile
 from typing import Optional
 
 import httpx
-from docx import Document
 from docx2python import docx2python
 import pymupdf
 from pptx import Presentation
 from PIL import Image
 from pydantic_settings import BaseSettings
 
-import io
 import re
 
 from collections import OrderedDict
 import threading
-
-
-SPEAKER_PATTERN_STRICT = re.compile(r"\*\*(SPEAKER_\d+)\*\*:\s*")
-SPEAKER_PATTERN_LOOSE = re.compile(r"\**\s*(SPEAKER_\d+)\s*\**:\s*")
-
-SPEAKER_PATTERN = re.compile(r"\*\*(SPEAKER_\d+|[^*]+)\*\*:\s*")
-
-
-def _split_transcript_turns(text: str) -> list[tuple[Optional[str], str]]:
-    matches = list(SPEAKER_PATTERN_STRICT.finditer(text))
-    if not matches:
-        matches = list(SPEAKER_PATTERN_LOOSE.finditer(text))
-
-    if not matches:
-        stripped = text.strip()
-        return [(None, stripped)] if stripped else []
-
-    turns: list[tuple[Optional[str], str]] = []
-
-    preamble = text[:matches[0].start()].strip()
-    if preamble:
-        turns.append((None, preamble))
-
-    for i, m in enumerate(matches):
-        label = m.group(1)
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        remainder = text[start:end].strip()
-        turns.append((label, remainder))
-
-    return turns
-
-
-def build_transcript_docx(title: str, text: str) -> Document:
-    doc = Document()
-    doc.add_heading(title, level=1)
-
-    for label, remainder in _split_transcript_turns(text):
-        if not remainder and not label:
-            continue
-
-        paragraph = doc.add_paragraph()
-
-        if label:
-            run = paragraph.add_run(f"{label}: ")
-            run.bold = True
-            paragraph.add_run(remainder)
-        else:
-            paragraph.add_run(remainder)
-
-    return doc
 
 
 class FileWorker:
@@ -294,7 +241,6 @@ class FileWorker:
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
             docx_path = tmp.name
 
-        converted_path: str | None = None
         try:
             result = subprocess.run(
                 [
@@ -313,12 +259,10 @@ class FileWorker:
                 auto_converted = doc_path.with_suffix(".docx")
                 if auto_converted.exists():
                     shutil.move(str(auto_converted), docx_path)
-                    converted_path = docx_path
                     return docx_path
                 else:
                     for file in doc_path.parent.glob(f"{doc_path.stem}*.docx"):
                         shutil.move(str(file), docx_path)
-                        converted_path = docx_path
                         return docx_path
 
             self.logger.error(f"LibreOffice conversion failed: {result.stderr[:200]}")
@@ -331,7 +275,7 @@ class FileWorker:
             self.logger.error(f"Unexpected conversion error: {e}", exc_info=True)
             return None
         finally:
-            if converted_path is None and os.path.exists(docx_path):
+            if os.path.exists(docx_path):
                 try:
                     os.unlink(docx_path)
                 except Exception as e:
@@ -457,6 +401,12 @@ class FileWorker:
                 self.logger.warning(f"Failed to remove temp PNG after EMF conversion: {e}")
 
     def _convert_segments_to_text(self, segments: list, diarization: bool) -> str:
+        """
+        Convert WhisperX segments to readable plain text, preserving
+        chronological order. Consecutive segments from the same speaker
+        are merged into one turn. With diarization enabled, each turn
+        is emitted as Markdown: "**SPEAKER_NN**: text".
+        """
         try:
             if not segments:
                 return "Транскрипция недоступна."
@@ -524,11 +474,7 @@ class FileWorker:
             return str(e)
 
         if response.status_code == 200:
-            try:
-                result = response.json()
-            except Exception:
-                return response.text
-
+            result = response.json()
             raw = result.get("result", result)
 
             segments = None
