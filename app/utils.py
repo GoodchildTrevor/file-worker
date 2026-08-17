@@ -11,16 +11,122 @@ import tempfile
 from typing import Optional
 
 import httpx
+from docx import Document
 from docx2python import docx2python
 import pymupdf
 from pptx import Presentation
 from PIL import Image
 from pydantic_settings import BaseSettings
 
+import io
 import re
 
 from collections import OrderedDict
 import threading
+
+
+SPEAKER_PATTERN_STRICT = re.compile(r"\*\*(SPEAKER_\d+)\*\*:\s*")
+SPEAKER_PATTERN_LOOSE = re.compile(r"\**\s*(SPEAKER_\d+)\s*\**:\s*")
+
+# Kept for backward compatibility with any external callers that import
+# SPEAKER_PATTERN directly.
+SPEAKER_PATTERN = re.compile(r"\*\*(SPEAKER_\d+|[^*]+)\*\*:\s*")
+
+# Служебная подпись, которую Whisper иногда подмешивает в распознанный
+# текст (артефакт исходных субтитров). Удаляем её построчно, независимо
+# от регистра, обрамления звёздочками/кавычками и лишних пробелов.
+WHISPER_CREDIT_PATTERN = re.compile(
+    r"^[\s*'\"\u00ab\u00bb]*субтитры\s+создал[аи]?\s+dimatorzhok[\s*'\"\u00ab\u00bb.,!:;-]*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _remove_whisper_credit_lines(text: str) -> str:
+    """
+    Remove stray "субтитры создал DimaTorzhok" credit lines that
+    sometimes leak into Whisper transcription output. Matching is
+    case-insensitive and tolerant of surrounding Markdown/quote
+    characters and whitespace. Only whole lines that consist solely of
+    this credit (ignoring decoration) are dropped; the phrase is left
+    untouched if it appears as part of normal speech within a longer
+    line.
+    """
+    if not text:
+        return text
+
+    kept_lines = [
+        line for line in text.splitlines()
+        if not WHISPER_CREDIT_PATTERN.match(line.strip())
+    ]
+    return "\n".join(kept_lines).strip()
+
+
+def _split_transcript_turns(text: str) -> list[tuple[Optional[str], str]]:
+    """
+    Locate speaker turns in a diarized transcript and return them as
+    (speaker_label, remainder_text) pairs, in order.
+
+    Tries the strict "**SPEAKER_NN**:" marker first (the canonical
+    format produced by FileWorker._convert_segments_to_text). If a
+    transcript was mangled upstream (e.g. by a Markdown parser eating
+    asterisks around an underscore-containing label -- a known Telegram
+    legacy-Markdown issue), falls back to a loose pattern that tolerates
+    0-2 asterisks around SPEAKER_NN, so the document still gets split
+    into one paragraph per speaker turn instead of collapsing into a
+    single blob.
+    """
+    matches = list(SPEAKER_PATTERN_STRICT.finditer(text))
+    if not matches:
+        matches = list(SPEAKER_PATTERN_LOOSE.finditer(text))
+
+    if not matches:
+        stripped = text.strip()
+        return [(None, stripped)] if stripped else []
+
+    turns: list[tuple[Optional[str], str]] = []
+
+    preamble = text[:matches[0].start()].strip()
+    if preamble:
+        turns.append((None, preamble))
+
+    for i, m in enumerate(matches):
+        label = m.group(1)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        remainder = text[start:end].strip()
+        turns.append((label, remainder))
+
+    return turns
+
+
+def build_transcript_docx(title: str, text: str) -> Document:
+    """
+    Build a Word document from a diarized transcript where each speaker
+    turn is formatted as "**SPEAKER_00**: text". Each turn becomes its
+    own paragraph with the speaker label in bold.
+
+    Robust to transcripts where the "**...**" markers were partially
+    stripped by an upstream Markdown parser: falls back to a loose
+    match so turns are still split into separate paragraphs instead of
+    collapsing into one.
+    """
+    doc = Document()
+    doc.add_heading(title, level=1)
+
+    for label, remainder in _split_transcript_turns(text):
+        if not remainder and not label:
+            continue
+
+        paragraph = doc.add_paragraph()
+
+        if label:
+            run = paragraph.add_run(f"{label}: ")
+            run.bold = True
+            paragraph.add_run(remainder)
+        else:
+            paragraph.add_run(remainder)
+
+    return doc
 
 
 class FileWorker:
@@ -404,8 +510,16 @@ class FileWorker:
         """
         Convert WhisperX segments to readable plain text, preserving
         chronological order. Consecutive segments from the same speaker
-        are merged into one turn. With diarization enabled, each turn
-        is emitted as Markdown: "**SPEAKER_NN**: text".
+        are merged into ONE turn/paragraph. Each turn is emitted as
+        "**SPEAKER_NN**: text" -- this exact format is required by
+        owui-tools/transcriber.py (SPEAKER_PATTERN /
+        build_transcript_docx), which splits on
+        (?=\*\*SPEAKER_\d+\*\*:) to build one docx paragraph per turn.
+        Do not change this format without updating the consumer too.
+
+        Any stray "субтитры создал DimaTorzhok" credit lines leaking
+        from the Whisper backend are stripped from each segment's text
+        before merging, so they never reach the final transcript.
         """
         try:
             if not segments:
@@ -427,6 +541,8 @@ class FileWorker:
                 else:
                     speaker = "Unknown"
                     text = str(seg).strip()
+
+                text = _remove_whisper_credit_lines(text)
 
                 if not text:
                     continue
@@ -492,6 +608,6 @@ class FileWorker:
                 diarization = bool(self.diarization_params)
                 return self._convert_segments_to_text(segments, diarization)
 
-            return str(raw)
+            return _remove_whisper_credit_lines(str(raw))
 
         return f"Transcription failed with status {response.status_code}"
