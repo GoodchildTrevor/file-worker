@@ -12,20 +12,15 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-
 from app.config import get_settings
 from app.utils import FileWorker
 
-
-
 settings = get_settings()
-
 
 LOG_PATH = "fileworker.log"
 logging.basicConfig(
@@ -38,32 +33,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 EXPORT_DIR = os.path.realpath((os.getenv("FILE_EXPORT_DIR") or "/output").rstrip("/"))
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# Публичный адрес, под которым nginx проксирует этот сервис наружу
-# (должен включать тот же префикс пути, что и FILE_ROUTE_PREFIX ниже).
 PUBLIC_BASE_URL = os.getenv("FILE_EXPORT_BASE_URL", "https://your-domain.example/files").rstrip("/")
-
-# Префикс пути для раздачи файлов внутри самого сервиса.
-# ВАЖНО: должен буквально совпадать с тем, что настроено в nginx
-# (location + proxy_pass) и с хвостом FILE_EXPORT_BASE_URL — иначе 404.
 FILE_ROUTE_PREFIX = "/" + os.getenv("FILE_ROUTE_PREFIX", "files").strip("/")
 
 FILE_TTL_DAYS = float(os.getenv("FILE_TTL_DAYS", "7"))
 FILE_TTL_SECONDS = FILE_TTL_DAYS * 24 * 60 * 60
 CLEANUP_INTERVAL_SECONDS = float(os.getenv("FILE_CLEANUP_INTERVAL_SECONDS", str(6 * 60 * 60)))
 
-
-# Ловит и канон, и покалеченные маркеры в одном тексте:
-# **SPEAKER_00**:, SPEAKER_00:, *SPEAKER_00**:, **SPEAKER_00*:
 SPEAKER_MARKER_PATTERN = re.compile(
     r"(?<!\w)\*{0,2}\s*(SPEAKER_\d+)\s*\*{0,2}\s*:\s*",
     flags=re.IGNORECASE,
 )
-
-# Литералы \n \r \t, которые приехали как текст, а не как переводы строк.
 LITERAL_ESCAPE_PATTERN = re.compile(r"\\[nrt]")
 
 
@@ -351,3 +334,4 @@ async def create_item(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8055)
+    
