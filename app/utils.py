@@ -24,21 +24,23 @@ import re
 from collections import OrderedDict
 import threading
 
+from app.config import get_settings
+
+settings = get_settings()
 
 SPEAKER_PATTERN_STRICT = re.compile(r"\*\*(SPEAKER_\d+)\*\*:\s*")
 SPEAKER_PATTERN_LOOSE = re.compile(r"\**\s*(SPEAKER_\d+)\s*\**:\s*")
 
-# Kept for backward compatibility with any external callers that import
-# SPEAKER_PATTERN directly.
 SPEAKER_PATTERN = re.compile(r"\*\*(SPEAKER_\d+|[^*]+)\*\*:\s*")
-
-# Служебная подпись, которую Whisper иногда подмешивает в распознанный
-# текст (артефакт исходных субтитров). Удаляем её построчно, независимо
-# от регистра, обрамления звёздочками/кавычками и лишних пробелов.
 WHISPER_CREDIT_PATTERN = re.compile(
     r"^[\s*'\"\u00ab\u00bb]*субтитры\s+создал[аи]?\s+dimatorzhok[\s*'\"\u00ab\u00bb.,!:;-]*$",
     flags=re.IGNORECASE,
 )
+
+# Magic bytes used to sniff the real format of a file claiming to be .doc.
+OLE2_MAGIC = b"\xd0\xcf\x11\xe0"     # genuine legacy Office (Word/Excel/PPT 97-2003)
+RTF_MAGIC = b"{\\rt"                 # RTF saved with a .doc extension (common in old Word)
+HTML_MAGICS = (b"<htm", b"<!doctype", b"<html")  # HTML saved with a .doc extension
 
 
 def _remove_whisper_credit_lines(text: str) -> str:
@@ -50,6 +52,8 @@ def _remove_whisper_credit_lines(text: str) -> str:
     this credit (ignoring decoration) are dropped; the phrase is left
     untouched if it appears as part of normal speech within a longer
     line.
+
+    :param text: The transcription output to clean.
     """
     if not text:
         return text
@@ -74,6 +78,8 @@ def _split_transcript_turns(text: str) -> list[tuple[Optional[str], str]]:
     0-2 asterisks around SPEAKER_NN, so the document still gets split
     into one paragraph per speaker turn instead of collapsing into a
     single blob.
+
+    :param text: The diarized transcript text to split.
     """
     matches = list(SPEAKER_PATTERN_STRICT.finditer(text))
     if not matches:
@@ -109,6 +115,9 @@ def build_transcript_docx(title: str, text: str) -> Document:
     stripped by an upstream Markdown parser: falls back to a loose
     match so turns are still split into separate paragraphs instead of
     collapsing into one.
+
+    :param title: Title for the document heading.
+    :param text: The diarized transcript text.
     """
     doc = Document()
     doc.add_heading(title, level=1)
@@ -130,6 +139,18 @@ def build_transcript_docx(title: str, text: str) -> Document:
 
 
 class FileWorker:
+    """
+    Extract plain text from files of many formats for downstream LLM processing.
+
+    ``text_extractor`` dispatches on the lowercased extension stored in
+    ``self.file_fmt``: raster images and PDF pages go to a local Ollama
+    vision model, audio/video is transcribed by a WhisperX backend (with
+    optional speaker diarization), Office files are parsed locally -- with
+    headless LibreOffice used as a fallback for legacy .doc conversion and
+    EMF-to-PNG rasterization. Extraction results are cached in memory per
+    (SHA-256 hash, format) pair up to ``settings.CACHE_MAXSIZE`` entries.
+    """
+
     def __init__(
             self,
             logger: Logger,
@@ -138,6 +159,15 @@ class FileWorker:
             settings: BaseSettings,
             diarization_params: dict
         ):
+        """
+        Initialize a worker for one input file.
+
+        :param logger: Logger used for all diagnostic output from this file.
+        :param file: Path to the source file on disk (str or Path).
+        :param file_fmt: File extension including the leading dot, e.g. ".pdf"; stored lowercased and used by ``text_extractor`` to pick a handler.
+        :param settings: Application settings providing limits, URLs and model names consumed by the extraction handlers.
+        :param diarization_params: Query parameters forwarded to the WhisperX API; non-empty values enable speaker diarization in the transcript output.
+        """
         self.settings = settings
         self.logger = logger
         self.file = file
@@ -148,11 +178,23 @@ class FileWorker:
         self._http_client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
+        """Return the lazily created shared ``httpx.AsyncClient``, recreating it if a previous instance was closed."""
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(timeout=120, follow_redirects=True)
         return self._http_client
 
     async def text_extractor(self) -> str:
+        """
+        Extract plain text from this file based on its format.
+
+        Dispatches to a per-format handler using ``self.file_fmt`` (images /
+        PDF / EMF -> Ollama vision, .docx/.doc/.pptx/.xlsx -> local parsers
+        with LibreOffice fallback for legacy .doc, media -> WhisperX). The
+        result is cached in memory keyed by the file's SHA-256 hash and
+        format; a cache hit short-circuits extraction entirely. Raises
+        ``ValueError`` when no handler exists for the extension and re-raises
+        (after logging) any failure from a handler.
+        """
         self.logger.info(f"Processing file with format {self.file_fmt}")
 
         file_hash = None
@@ -165,7 +207,7 @@ class FileWorker:
             self.logger.warning(f"Failed to hash file, skipping cache: {e}")
 
         try:
-            if self.file_fmt in [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"]:
+            if self.file_fmt in settings.PICTURES_EXTENSIONS:
                 text = await self._extract_text_from_image()
             elif self.file_fmt == ".pdf":
                 text = await self._extract_text_from_pdf()
@@ -177,16 +219,17 @@ class FileWorker:
                 text = self._extract_text_from_xlsx()
             elif self.file_fmt == ".emf":
                 text = await self._extract_text_from_emf()
-            elif self.file_fmt in [
-                ".mp3", ".wav", ".flac", ".ogg", ".webm", ".mov", ".mkv", ".avi", ".mp4"
-            ]:
+            elif self.file_fmt in settings.MEDIA_EXTENSIONS:
                 text = await self._extract_text_from_media()
             else:
                 error_msg = f"Unsupported format: {self.file_fmt}. No handler implemented in FileWorker."
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
 
-            if file_hash is not None and text.strip():
+            # Never cache error placeholders: they look like valid results
+            # ("length: N characters" + HTTP 200) and would be served from
+            # cache on every subsequent request for the same file.
+            if file_hash is not None and text.strip() and not text.startswith("[Error"):
                 self._set_cached_text(file_hash, self.file_fmt, text)
                 self.logger.debug(f"Cached result for {file_hash}:{self.file_fmt}")
 
@@ -198,6 +241,12 @@ class FileWorker:
             raise
 
     def _compute_file_hash(self, file_path: str | Path, chunk_size: int = 8192) -> str:
+        """
+        Compute the SHA-256 hex digest of a file by reading it in fixed-size chunks.
+
+        :param file_path: Path to the file.
+        :param chunk_size: Size of chunks to read.
+        """
         sha256 = hashlib.sha256()
         with open(file_path, 'rb') as f:
             while chunk := f.read(chunk_size):
@@ -205,6 +254,12 @@ class FileWorker:
         return sha256.hexdigest()
 
     def _get_cached_text(self, file_hash: str, file_format: str) -> Optional[str]:
+        """
+        Return cached extraction text for (file_hash, file_format), or None on a miss; a hit refreshes the entry's LRU position.
+
+        :param file_hash: SHA-256 hash of the file.
+        :param file_format: File extension/format.
+        """
         cache_key = f"{file_hash}:{file_format}"
         with self._cache_lock:
             if cache_key in self._document_cache:
@@ -213,6 +268,13 @@ class FileWorker:
         return None
 
     def _set_cached_text(self, file_hash: str, file_format: str, text: str) -> None:
+        """
+        Store extracted text under (file_hash, file_format), evicting the least recently used entry once ``settings.CACHE_MAXSIZE`` is exceeded.
+
+        :param file_hash: SHA-256 hash of the file.
+        :param file_format: File extension/format.
+        :param text: The extracted text to store.
+        """
         cache_key = f"{file_hash}:{file_format}"
         with self._cache_lock:
             self._document_cache[cache_key] = text
@@ -221,6 +283,15 @@ class FileWorker:
                 self._document_cache.popitem(last=False)
 
     async def _extract_text_from_pdf(self) -> str:
+        """
+        Rasterize every PDF page to PNG at ``settings.DPI`` and run it through
+        Ollama vision, returning the pages joined with "--- Page N ---"
+        separators. Refuses documents longer than ``settings.PDF_PAGES_LIMIT``;
+        per-page problems are recorded inline as [error]/[crash] markers
+        instead of aborting the whole document, and each temporary PNG is
+        cleaned up afterwards. Returns a "[PDF poorly recognized...]" prefix
+        when the combined result is under 50 characters.
+        """
         full_text = []
         with pymupdf.open(self.file) as doc:
             pages = len(doc)
@@ -269,6 +340,12 @@ class FileWorker:
         return result
 
     def _convert_emf_to_png(self, emf_path: str) -> str | None:
+        """
+        Convert an EMF vector image to PNG next to the source file using headless LibreOffice; 
+        returns the PNG path or None on failure (missing binary, non-zero exit code, timeout).
+
+        :param emf_path: Path to the EMF file.
+        """
         emf_path = Path(emf_path)
         png_path = emf_path.with_suffix(".png")
 
@@ -309,12 +386,22 @@ class FileWorker:
             return None
 
     async def _extract_text_from_image(self) -> str:
+        """
+        Describe a raster image via Ollama vision, 
+        wrapping successful output in a "📸 **IMAGE ANALYSIS:**" header; 
+        errors are returned as bracketed message strings rather than raised.
+        """
         description = await self._send_image_to_ollama(self.file)
         if description and not description.startswith("["):
             return f"📸 **IMAGE ANALYSIS:**\n\n{description}"
         return description
 
     def _extract_text_from_word(self) -> str:
+        """
+        Extract body/header/footer text from a Word document via docx2python.
+        Legacy .doc files are converted to a temporary .docx first, which is
+        removed afterwards; on failure the error is logged and "" returned.
+        """
         try:
             if self.file_fmt == ".doc":
                 docx_path = self._convert_doc_to_docx(self.file)
@@ -338,22 +425,70 @@ class FileWorker:
             return ""
 
     def _convert_doc_to_docx(self, doc_path: str | Path) -> str | None:
+        """
+        Convert a legacy .doc file to .docx using headless LibreOffice;
+        returns the path of a temporary .docx copy for the caller to read,
+        or None on failure (missing binary, non-zero exit code, missing
+        output, timeout).
+
+        Files saved by older Word versions (and many third-party
+        converters) are often RTF or HTML carrying a .doc extension.
+        Those are NOT rejected here: the real format is sniffed via magic
+        bytes and reported in the log, but conversion is still attempted,
+        because headless LibreOffice converts RTF/HTML just fine.
+
+        The caller is responsible for deleting the returned temporary
+        .docx file once it is done reading it (``_extract_text_from_word``
+        does this in its own ``finally``). Note: this function must NOT
+        unlink the file itself -- a previous unconditional ``finally``
+        cleanup here deleted the freshly converted docx before the caller
+        could open it, which made every .doc extraction fail.
+
+        :param doc_path: Path to the source .doc file.
+        """
         doc_path = Path(doc_path)
 
         if not shutil.which("libreoffice"):
             self.logger.error("LibreOffice not found. Required for .doc conversion.")
             return None
 
+        try:
+            with open(doc_path, "rb") as f:
+                magic = f.read(16)
+            if magic.startswith(RTF_MAGIC):
+                self.logger.warning(
+                    f"File {doc_path.name} is actually RTF with a .doc extension; "
+                    f"attempting LibreOffice conversion anyway."
+                )
+            elif magic.lower().startswith(HTML_MAGICS):
+                self.logger.warning(
+                    f"File {doc_path.name} is actually HTML with a .doc extension; "
+                    f"attempting LibreOffice conversion anyway."
+                )
+        except OSError as e:
+            self.logger.error(f"Cannot read {doc_path} for magic byte check: {e}")
+            return None
+
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
             docx_path = tmp.name
+
+        # Isolated LibreOffice profile so that parallel headless invocations
+        # don't fight over the shared default profile lock (a common cause
+        # of exit code 0 with no output file).
+        profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
+        # Convert into a dedicated temp dir: converting into the source
+        # file's parent required globbing it for *.docx afterwards, which
+        # could pick up a stale file left there by an earlier run.
+        out_dir = tempfile.mkdtemp(prefix="doc_convert_")
 
         try:
             result = subprocess.run(
                 [
                     "libreoffice",
                     "--headless",
+                    f"-env:UserInstallation=file://{profile_dir}",
                     "--convert-to", "docx",
-                    "--outdir", str(doc_path.parent),
+                    "--outdir", out_dir,
                     str(doc_path)
                 ],
                 capture_output=True,
@@ -362,14 +497,15 @@ class FileWorker:
             )
 
             if result.returncode == 0:
-                auto_converted = doc_path.with_suffix(".docx")
-                if auto_converted.exists():
-                    shutil.move(str(auto_converted), docx_path)
+                converted = next(Path(out_dir).glob("*.docx"), None)
+                if converted is not None:
+                    shutil.move(str(converted), docx_path)
                     return docx_path
-                else:
-                    for file in doc_path.parent.glob(f"{doc_path.stem}*.docx"):
-                        shutil.move(str(file), docx_path)
-                        return docx_path
+                self.logger.error(
+                    f"LibreOffice reported success but produced no .docx output. "
+                    f"Stdout: {result.stdout[:200]}"
+                )
+                return None
 
             self.logger.error(f"LibreOffice conversion failed: {result.stderr[:200]}")
             return None
@@ -381,13 +517,20 @@ class FileWorker:
             self.logger.error(f"Unexpected conversion error: {e}", exc_info=True)
             return None
         finally:
-            if os.path.exists(docx_path):
-                try:
-                    os.unlink(docx_path)
-                except Exception as e:
-                    self.logger.warning(f"Failed to cleanup temp docx file: {e}")
+            # Clean up the throwaway LibreOffice profile and conversion
+            # directory only; the temp .docx itself belongs to the caller
+            # now (see docstring).
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            shutil.rmtree(out_dir, ignore_errors=True)
 
     async def _send_image_to_ollama(self, image_path: str | Path) -> str:
+        """
+        Base64-encode an image and POST it to the local Ollama vision model 
+        for a description; returns the response text or a bracketed "[...]" 
+        error/timeout string (never raises).
+
+        :param image_path: Path to the image file.
+        """
         try:
             with open(image_path, "rb") as f:
                 img_base64 = base64.b64encode(f.read()).decode('utf-8')
@@ -419,6 +562,15 @@ class FileWorker:
             return f"[Error sending to Ollama: {str(e)}]"
 
     def _safe_decode(self, s: str) -> str:
+        """
+        Repair Cyrillic mojibake from Word output by re-encoding 
+        ``s`` as latin1 and decoding it as cp1251; 
+        the result is used only if it contains more Cyrillic characters 
+        than the input (otherwise ``s`` is returned unchanged). 
+        Non-string input passes through untouched.
+
+        :param s: The string to decode.
+        """
         if not isinstance(s, str):
             return s
         try:
@@ -431,6 +583,10 @@ class FileWorker:
             return s
 
     def _extract_text_from_pptx(self) -> str:
+        """
+        Concatenate all non-empty shape text from every slide of a PowerPoint deck, 
+        grouped under "--- Slide N ---" headers; returns "" on failure (logged).
+        """
         try:
             prs = Presentation(self.file)
             text_lines = []
@@ -451,6 +607,14 @@ class FileWorker:
             return ""
 
     def _extract_text_from_xlsx(self) -> str:
+        """
+        Dump an Excel workbook to text: per sheet, 
+        non-empty cell values are joined with " | " and rows 
+        grouped under a "--- Sheet: name ---" header 
+        (formulas read as evaluated via ``data_only``); 
+        returns "[Excel file is empty]" 
+        when there is no content and a bracketed error message on failure.
+        """
         try:
             import openpyxl
             wb = openpyxl.load_workbook(self.file, read_only=True, data_only=True)
@@ -474,9 +638,19 @@ class FileWorker:
             return f"[Excel processing error: {e}]"
 
     def _word_to_text(self, all_parts: list[list[list[list[list[str]]]]]) -> str:
+        """
+        Flatten the nested lists of strings returned by docx2python into 
+        a single newline-joined string, applying ``_safe_decode`` to every non-empty piece.
+
+        :param all_parts: The nested parts extracted from the document.
+        """
         text_items = []
 
         def extract_text_recursively(data: str | Iterable) -> None:
+            """Recursively flatten nested iterables of strings into ``text_items``, applying ``_safe_decode`` to each non-empty string.
+
+            :param data: A string or an iterable of strings/nested iterables to process.
+            """
             if isinstance(data, str):
                 if data and data.strip():
                     decoded = self._safe_decode(data.strip())
@@ -491,6 +665,12 @@ class FileWorker:
         return '\n'.join(filter(None, text_items))
 
     async def _extract_text_from_emf(self) -> str:
+        """
+        Convert an EMF vector image to PNG and describe it via Ollama vision, 
+        wrapping the result in a "🖼️ **VECTOR IMAGE ANALYSIS (EMF):**" header; 
+        the temporary PNG is always removed afterwards and failures are returned 
+        as bracketed message strings.
+        """
         png_path = self._convert_emf_to_png(self.file)
         if not png_path:
             return "[Error: failed to convert EMF to PNG]"
@@ -512,14 +692,17 @@ class FileWorker:
         chronological order. Consecutive segments from the same speaker
         are merged into ONE turn/paragraph. Each turn is emitted as
         "**SPEAKER_NN**: text" -- this exact format is required by
-        owui-tools/transcriber.py (SPEAKER_PATTERN /
-        build_transcript_docx), which splits on
-        (?=\*\*SPEAKER_\d+\*\*:) to build one docx paragraph per turn.
+        owui-tools/transcriber.py (SPEAKER_PATTERN / 
+        build_transcript_docx), which splits right before each
+        **SPEAKER_NN**: marker to build one docx paragraph per turn.
         Do not change this format without updating the consumer too.
 
         Any stray "субтитры создал DimaTorzhok" credit lines leaking
         from the Whisper backend are stripped from each segment's text
         before merging, so they never reach the final transcript.
+
+        :param segments: The transcription segments.
+        :param diarization: Whether to include speaker labels.
         """
         try:
             if not segments:
@@ -574,6 +757,14 @@ class FileWorker:
                 return str(segments)
 
     async def _extract_text_from_media(self) -> str:
+        """
+        Transcribe audio/video via the WhisperX HTTP API, forwarding
+        ``self.diarization_params`` as query parameters. A successful response
+        may carry a segments list (converted to "**SPEAKER_NN**: text" turns by
+        ``_convert_segments_to_text`` when diarization was requested) or plain
+        text (returned after stripping leaked credit lines). Failures are
+        returned as strings rather than raised.
+        """
         filename = os.path.basename(self.file)
         try:
             client = await self._get_client()
@@ -611,3 +802,4 @@ class FileWorker:
             return _remove_whisper_credit_lines(str(raw))
 
         return f"Transcription failed with status {response.status_code}"
+
