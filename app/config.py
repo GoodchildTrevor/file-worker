@@ -15,7 +15,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    MAX_FILE_SIZE: int = 200 * 1024 * 1024
+    MAX_FILE_SIZE: int = 500 * 1024 * 1024
 
     PDF_PAGES_LIMIT: int = 21
     DPI: int = 300
@@ -41,12 +41,18 @@ class Settings(BaseSettings):
             3. Step 3
     """)
 
-    SUPPORTED_EXTENSIONS: set = {
-        ".pdf", ".jpg", ".jpeg", ".png", ".pptx", ".docx", ".doc", ".emf",
-        ".xlsx",
-        ".mp3", ".wav", ".flac", ".ogg", ".webm",
-        ".mp4", ".mov", ".mkv", ".avi",
+    DOCS_EXTENSIONS: set = {
+        ".pdf", ".pptx", ".docx", ".doc", ".emf", ".xlsx",
     }
+    MEDIA_EXTENSIONS: set = {
+        ".mp3", ".wav", ".flac", ".ogg", ".webm", ".aac", ".m4a",
+        ".mp4", ".mov", ".mkv", ".avi", 
+    }
+    PICTURES_EXTENSIONS: set = {
+        ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"
+    }
+
+    SUPPORTED_EXTENSIONS: set = DOCS_EXTENSIONS | MEDIA_EXTENSIONS | PICTURES_EXTENSIONS
 
     MIME_TO_EXT: dict = {
         "application/pdf": ".pdf",
@@ -67,6 +73,8 @@ class Settings(BaseSettings):
         "audio/ogg": ".ogg",
         "audio/x-flac": ".flac",
         "audio/webm": ".webm",
+        "audio/aac": ".aac",
+        "audio/m4a": ".m4a",
 
         # Video
         "video/mp4": ".mp4",
@@ -82,3 +90,4 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+    
