@@ -5,6 +5,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      # Loopback only: nginx on the same host proxies to this port.
+      # Use "8055:8055" if clients connect from other hosts.
+      - "127.0.0.1:8055:8055"
     volumes:
-      - ./logs:/app/logs 
-      
+      - ./logs:/app/logs
+      # FILE_EXPORT_DIR (see .env.example) - exported .docx files must survive
+      # container recreation, because links with a 7-day TTL are handed out.
+      - ./output:/output

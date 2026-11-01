@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from collections.abc import Iterable
 import hashlib
@@ -41,6 +42,16 @@ WHISPER_CREDIT_PATTERN = re.compile(
 OLE2_MAGIC = b"\xd0\xcf\x11\xe0"     # genuine legacy Office (Word/Excel/PPT 97-2003)
 RTF_MAGIC = b"{\\rt"                 # RTF saved with a .doc extension (common in old Word)
 HTML_MAGICS = (b"<htm", b"<!doctype", b"<html")  # HTML saved with a .doc extension
+
+# Every error placeholder returned by _send_image_to_ollama starts with this
+# prefix. Callers and the result cache test for it; a legitimate model answer
+# may start with "[" (IMAGE_PROMPT asks for tables in that form), so a bare
+# "[" check is not enough.
+OLLAMA_ERROR_PREFIX = "[Error"
+
+# Upper bound on pixels per rendered PDF page (about A3 at 300 DPI). Larger
+# pages are rendered at a lower zoom so one page cannot allocate hundreds of MB.
+MAX_PAGE_PIXELS = 30_000_000
 
 
 def _remove_whisper_credit_lines(text: str) -> str:
@@ -151,6 +162,11 @@ class FileWorker:
     (SHA-256 hash, format) pair up to ``settings.CACHE_MAXSIZE`` entries.
     """
 
+    # Shared by all instances: main.py creates one FileWorker per request, so an
+    # instance-level cache would never produce a hit.
+    _document_cache: OrderedDict = OrderedDict()
+    _cache_lock = threading.Lock()
+
     def __init__(
             self,
             logger: Logger,
@@ -166,15 +182,13 @@ class FileWorker:
         :param file: Path to the source file on disk (str or Path).
         :param file_fmt: File extension including the leading dot, e.g. ".pdf"; stored lowercased and used by ``text_extractor`` to pick a handler.
         :param settings: Application settings providing limits, URLs and model names consumed by the extraction handlers.
-        :param diarization_params: Query parameters forwarded to the WhisperX API; non-empty values enable speaker diarization in the transcript output.
+        :param diarization_params: Query parameters forwarded to the WhisperX API; a truthy ``diarization`` key enables speaker labels in the transcript output.
         """
         self.settings = settings
         self.logger = logger
         self.file = file
         self.diarization_params = diarization_params
         self.file_fmt = file_fmt.lower()
-        self._document_cache = OrderedDict()
-        self._cache_lock = threading.Lock()
         self._http_client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -199,7 +213,7 @@ class FileWorker:
 
         file_hash = None
         try:
-            file_hash = self._compute_file_hash(self.file)
+            file_hash = await asyncio.to_thread(self._compute_file_hash, self.file)
             if (cached := self._get_cached_text(file_hash, self.file_fmt)) is not None:
                 self.logger.info(f"Cache HIT for {self.file} ({self.file_fmt})")
                 return cached
@@ -212,11 +226,11 @@ class FileWorker:
             elif self.file_fmt == ".pdf":
                 text = await self._extract_text_from_pdf()
             elif self.file_fmt in [".docx", ".doc"]:
-                text = self._extract_text_from_word()
+                text = await asyncio.to_thread(self._extract_text_from_word)
             elif self.file_fmt == ".pptx":
-                text = self._extract_text_from_pptx()
+                text = await asyncio.to_thread(self._extract_text_from_pptx)
             elif self.file_fmt == ".xlsx":
-                text = self._extract_text_from_xlsx()
+                text = await asyncio.to_thread(self._extract_text_from_xlsx)
             elif self.file_fmt == ".emf":
                 text = await self._extract_text_from_emf()
             elif self.file_fmt in settings.MEDIA_EXTENSIONS:
@@ -229,7 +243,7 @@ class FileWorker:
             # Never cache error placeholders: they look like valid results
             # ("length: N characters" + HTTP 200) and would be served from
             # cache on every subsequent request for the same file.
-            if file_hash is not None and text.strip() and not text.startswith("[Error"):
+            if file_hash is not None and text.strip() and not text.startswith(OLLAMA_ERROR_PREFIX):
                 self._set_cached_text(file_hash, self.file_fmt, text)
                 self.logger.debug(f"Cached result for {file_hash}:{self.file_fmt}")
 
@@ -284,7 +298,8 @@ class FileWorker:
 
     async def _extract_text_from_pdf(self) -> str:
         """
-        Rasterize every PDF page to PNG at ``settings.DPI`` and run it through
+        Rasterize every PDF page to PNG at ``settings.DPI`` (capped by
+        ``MAX_PAGE_PIXELS``, see ``_render_page_to_png``) and run it through
         Ollama vision, returning the pages joined with "--- Page N ---"
         separators. Refuses documents longer than ``settings.PDF_PAGES_LIMIT``;
         per-page problems are recorded inline as [error]/[crash] markers
@@ -302,17 +317,11 @@ class FileWorker:
             for page_num in range(pages):
                 tmp_img_path = None
                 try:
-                    page = doc.load_page(page_num)
-                    pix = page.get_pixmap(dpi=self.settings.DPI)
-
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
-                        tmp_img_path = tmp_img.name
-                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                        img.save(tmp_img_path, format="PNG")
+                    tmp_img_path = await asyncio.to_thread(self._render_page_to_png, doc, page_num)
 
                     page_text = await self._send_image_to_ollama(tmp_img_path)
 
-                    if page_text and not page_text.startswith("["):
+                    if page_text and not page_text.startswith(OLLAMA_ERROR_PREFIX):
                         full_text.append(f"--- Page {page_num + 1} ---\n{page_text}")
                         self.logger.info(f"Page {page_num + 1}: extracted {len(page_text)} chars")
                     else:
@@ -339,6 +348,38 @@ class FileWorker:
             return f"[PDF poorly recognized, only {total_chars} characters]\n{result}"
         return result
 
+    def _render_page_to_png(self, doc: pymupdf.Document, page_num: int) -> str:
+        """
+        Rasterize one PDF page to a temporary PNG file and return its path.
+
+        The zoom factor follows ``settings.DPI`` but is reduced so that the pixmap
+        never exceeds ``MAX_PAGE_PIXELS``: an A0 page at 300 DPI would otherwise
+        allocate more than 400 MB per copy. Runs synchronously; call it via
+        ``asyncio.to_thread`` so the event loop is not blocked.
+
+        :param doc: Open PyMuPDF document.
+        :param page_num: Zero-based page index.
+        """
+        page = doc.load_page(page_num)
+        zoom = self.settings.DPI / 72
+        area = page.rect.width * page.rect.height * zoom * zoom
+        if area > MAX_PAGE_PIXELS:
+            zoom = zoom * (MAX_PAGE_PIXELS / area) ** 0.5
+            self.logger.warning(
+                f"Page {page_num + 1} is too large for {self.settings.DPI} DPI; rendering at zoom {zoom:.2f}"
+            )
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
+            tmp_img_path = tmp_img.name
+        try:
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            img.save(tmp_img_path, format="PNG")
+        except Exception:
+            Path(tmp_img_path).unlink(missing_ok=True)
+            raise
+        return tmp_img_path
+
     def _convert_emf_to_png(self, emf_path: str) -> str | None:
         """
         Convert an EMF vector image to PNG next to the source file using headless LibreOffice; 
@@ -355,11 +396,15 @@ class FileWorker:
             )
             return None
 
+        # Isolated profile: conversions run in worker threads now, so two
+        # concurrent LibreOffice processes must not share the default profile.
+        profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
         try:
             result = subprocess.run(
                 [
                     "libreoffice",
                     "--headless",
+                    f"-env:UserInstallation=file://{profile_dir}",
                     "--convert-to", "png",
                     "--outdir", str(emf_path.parent),
                     str(emf_path)
@@ -384,6 +429,8 @@ class FileWorker:
         except Exception as e:
             self.logger.error(f"Unexpected EMF conversion error: {e}", exc_info=True)
             return None
+        finally:
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
     async def _extract_text_from_image(self) -> str:
         """
@@ -392,7 +439,7 @@ class FileWorker:
         errors are returned as bracketed message strings rather than raised.
         """
         description = await self._send_image_to_ollama(self.file)
-        if description and not description.startswith("["):
+        if description and not description.startswith(OLLAMA_ERROR_PREFIX):
             return f"📸 **IMAGE ANALYSIS:**\n\n{description}"
         return description
 
@@ -400,13 +447,13 @@ class FileWorker:
         """
         Extract body/header/footer text from a Word document via docx2python.
         Legacy .doc files are converted to a temporary .docx first, which is
-        removed afterwards; on failure the error is logged and "" returned.
+        removed afterwards; failures are logged and re-raised.
         """
         try:
             if self.file_fmt == ".doc":
                 docx_path = self._convert_doc_to_docx(self.file)
                 if not docx_path:
-                    return "[Error: failed to convert .doc to .docx]"
+                    raise RuntimeError("failed to convert .doc to .docx")
 
                 try:
                     with docx2python(docx_path) as doc_result:
@@ -422,7 +469,7 @@ class FileWorker:
 
         except Exception as e:
             self.logger.error(f"Error processing Word document: {e}")
-            return ""
+            raise
 
     def _convert_doc_to_docx(self, doc_path: str | Path) -> str | None:
         """
@@ -548,18 +595,18 @@ class FileWorker:
 
             if response.status_code == 200:
                 description = response.json().get("response", "").strip()
-                return description if description else "[Image processed, but no description received]"
+                return description if description else f"{OLLAMA_ERROR_PREFIX}: image processed, but no description received]"
             else:
                 ct = response.headers.get("content-type", "")
                 error_detail = response.json().get("error", "") if ct.startswith("application/json") else response.text[:100]
-                return f"[Ollama error {response.status_code}: {error_detail}]"
+                return f"{OLLAMA_ERROR_PREFIX}: Ollama error {response.status_code}: {error_detail}]"
 
         except httpx.TimeoutException:
-            return "[Timeout when connecting to Ollama]"
+            return f"{OLLAMA_ERROR_PREFIX}: timeout when connecting to Ollama]"
         except FileNotFoundError:
-            return "[Image file not found]"
+            return f"{OLLAMA_ERROR_PREFIX}: image file not found]"
         except Exception as e:
-            return f"[Error sending to Ollama: {str(e)}]"
+            return f"{OLLAMA_ERROR_PREFIX} sending to Ollama: {str(e)}]"
 
     def _safe_decode(self, s: str) -> str:
         """
@@ -585,7 +632,7 @@ class FileWorker:
     def _extract_text_from_pptx(self) -> str:
         """
         Concatenate all non-empty shape text from every slide of a PowerPoint deck, 
-        grouped under "--- Slide N ---" headers; returns "" on failure (logged).
+        grouped under "--- Slide N ---" headers; failures are logged and re-raised.
         """
         try:
             prs = Presentation(self.file)
@@ -604,7 +651,7 @@ class FileWorker:
             return "\n".join(text_lines)
         except Exception as e:
             self.logger.error(f"Error processing PowerPoint: {e}")
-            return ""
+            raise
 
     def _extract_text_from_xlsx(self) -> str:
         """
@@ -613,7 +660,7 @@ class FileWorker:
         grouped under a "--- Sheet: name ---" header 
         (formulas read as evaluated via ``data_only``); 
         returns "[Excel file is empty]" 
-        when there is no content and a bracketed error message on failure.
+        when there is no content; failures are logged and re-raised.
         """
         try:
             import openpyxl
@@ -635,7 +682,7 @@ class FileWorker:
 
         except Exception as e:
             self.logger.error(f"Error processing Excel: {e}")
-            return f"[Excel processing error: {e}]"
+            raise
 
     def _word_to_text(self, all_parts: list[list[list[list[list[str]]]]]) -> str:
         """
@@ -668,16 +715,16 @@ class FileWorker:
         """
         Convert an EMF vector image to PNG and describe it via Ollama vision, 
         wrapping the result in a "🖼️ **VECTOR IMAGE ANALYSIS (EMF):**" header; 
-        the temporary PNG is always removed afterwards and failures are returned 
-        as bracketed message strings.
+        the temporary PNG is always removed afterwards. A failed conversion raises
+        ``RuntimeError``; Ollama errors are returned as bracketed strings.
         """
-        png_path = self._convert_emf_to_png(self.file)
+        png_path = await asyncio.to_thread(self._convert_emf_to_png, self.file)
         if not png_path:
-            return "[Error: failed to convert EMF to PNG]"
+            raise RuntimeError("failed to convert EMF to PNG")
 
         try:
             description = await self._send_image_to_ollama(png_path)
-            if description and not description.startswith("["):
+            if description and not description.startswith(OLLAMA_ERROR_PREFIX):
                 return f"🖼️ **VECTOR IMAGE ANALYSIS (EMF):**\n\n{description}"
             return description
         finally:
@@ -762,9 +809,12 @@ class FileWorker:
         ``self.diarization_params`` as query parameters. A successful response
         may carry a segments list (converted to "**SPEAKER_NN**: text" turns by
         ``_convert_segments_to_text`` when diarization was requested) or plain
-        text (returned after stripping leaked credit lines). Failures are
-        returned as strings rather than raised.
+        text (returned after stripping leaked credit lines). A missing
+        ``WHISPER_API_URL``, a failed request or a non-200 response raises.
         """
+        if not self.settings.WHISPER_API_URL:
+            raise RuntimeError("WHISPER_API_URL is not configured")
+
         filename = os.path.basename(self.file)
         try:
             client = await self._get_client()
@@ -778,7 +828,7 @@ class FileWorker:
                 )
         except Exception as e:
             self.logger.error(f"Error during transcription request: {e}")
-            return str(e)
+            raise
 
         if response.status_code == 200:
             result = response.json()
@@ -796,10 +846,12 @@ class FileWorker:
                     pass
 
             if segments is not None:
-                diarization = bool(self.diarization_params)
+                diarization = bool((self.diarization_params or {}).get("diarization"))
                 return self._convert_segments_to_text(segments, diarization)
 
             return _remove_whisper_credit_lines(str(raw))
 
-        return f"Transcription failed with status {response.status_code}"
+        raise RuntimeError(
+            f"Transcription failed with status {response.status_code}: {response.text[:200]}"
+        )
 

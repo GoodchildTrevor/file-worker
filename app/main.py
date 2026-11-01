@@ -22,7 +22,8 @@ from app.utils import FileWorker
 
 settings = get_settings()
 
-LOG_PATH = "fileworker.log"
+LOG_PATH = "logs/fileworker.log"
+os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -205,7 +206,8 @@ async def export_docx(payload: ExportDocxRequest) -> ExportDocxResponse:
     )
 
     try:
-        process = subprocess.run(
+        process = await asyncio.to_thread(
+            subprocess.run,
             ["pandoc", "-f", "html", "-t", "docx", "-o", file_path],
             input=html_content.encode("utf-8"),
             capture_output=True,
@@ -272,9 +274,11 @@ async def create_item(
     :return: Extracted text from the document.
     :raises HTTPException: If file type is unsupported or processing fails.
     """
-    diarization_params = None
+    diarization_params = {}
+    if language:
+        diarization_params["language"] = language
     if diarization:
-        diarization_params = {"diarization": diarization, "language": language}
+        diarization_params["diarization"] = diarization
         if num_speakers is not None:
             diarization_params["num_participants"] = num_speakers
 
@@ -291,23 +295,31 @@ async def create_item(
             detail=f"Unsupported file format {file_ext}. Supported: {', '.join(settings.SUPPORTED_EXTENSIONS)}"
         )
 
-    try:
-        content = await file.read()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read uploaded file: {str(e)}")
+    too_large_detail = f"File too large. Maximum size is {settings.MAX_FILE_SIZE/1024/1024}MB"
+    if file.size is not None and file.size > settings.MAX_FILE_SIZE:
+        logger.error(too_large_detail)
+        raise HTTPException(status_code=413, detail=too_large_detail)
 
-    if len(content) > settings.MAX_FILE_SIZE:
-        logger.error(f"File too large. Maximum size is {settings.MAX_FILE_SIZE/1024/1024}MB")
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum size is {settings.MAX_FILE_SIZE/1024/1024}MB"
-        )
-
+    # Stream the upload to disk in chunks: never hold the whole body in memory,
+    # and enforce the limit while reading in case the parser reported no size.
+    tmp_file_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
-            tmp_file.write(content)
             tmp_file_path = tmp_file.name
+            written = 0
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > settings.MAX_FILE_SIZE:
+                    logger.error(too_large_detail)
+                    raise HTTPException(status_code=413, detail=too_large_detail)
+                tmp_file.write(chunk)
+    except HTTPException:
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
+        raise
     except Exception as e:
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")
 
     try:
